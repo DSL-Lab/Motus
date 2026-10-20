@@ -1,0 +1,18 @@
+{
+  "tasks_file": "../WAM-RoboTwin/experiments/fastwam12/tasks.txt",
+  "splits": ["demo_clean", "demo_randomized"],
+  "seeds": [42],
+  "episodes": 20,
+  "instruction_type": "unseen",
+  "variants": [
+    ["dense", 1.0], ["spline", 1.0],
+    ["dense", 1.5], ["spline", 1.5],
+    ["dense", 2.0], ["spline", 2.0]
+  ],
+  "joint_tolerances_rad": [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01],
+  "max_controls": 16,
+  "alignment": "none",
+  "source_timestamp_unit": "action_sample_index",
+  "executor": "robotwin_qpos_topp",
+  "accelerated_rollouts_status": "blocked: variable-duration TOPP target calls have no fixed target period"
+}

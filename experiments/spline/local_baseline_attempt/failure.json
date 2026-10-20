@@ -1,0 +1,6 @@
+{
+  "type": "RuntimeError",
+  "message": "Preflight blocked; see C:\\Users\\Kevin\\Personal\\Research\\Robotics Research\\Motus\\experiments\\spline\\local_baseline_attempt\\preflight.json",
+  "traceback": "Traceback (most recent call last):\n  File \"C:\\Users\\Kevin\\Personal\\Research\\Robotics Research\\Motus\\inference\\robotwin\\spline_experiment.py\", line 208, in main\n    run(args, config)\n    ~~~^^^^^^^^^^^^^^\n  File \"C:\\Users\\Kevin\\Personal\\Research\\Robotics Research\\Motus\\inference\\robotwin\\spline_experiment.py\", line 76, in run\n    raise RuntimeError(\"Preflight blocked; see \" + str(output / \"preflight.json\"))\nRuntimeError: Preflight blocked; see C:\\Users\\Kevin\\Personal\\Research\\Robotics Research\\Motus\\experiments\\spline\\local_baseline_attempt\\preflight.json\n",
+  "rollout_completed": false
+}

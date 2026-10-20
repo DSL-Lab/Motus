@@ -1,0 +1,34 @@
+{
+  "status": "blocked",
+  "baseline_rollout_completed": false,
+  "motus_revision": "88f6fe30c62af033874b0a2e48ad1cbdaf12cfdf",
+  "robotwin_revision": "87942e06cdf9968a41a5a1320946e10a9fdd706d",
+  "paths": {
+    "robotwin_eval": "C:\\Users\\Kevin\\Personal\\Research\\Robotics Research\\WAM-RoboTwin\\script\\eval_policy.py",
+    "shared_interpreter": "C:\\Users\\Kevin\\Personal\\Research\\Robotics Research\\uv_envs\\robotwin-classic\\Scripts\\python.exe",
+    "task_config_directory": "C:\\Users\\Kevin\\Personal\\Research\\Robotics Research\\WAM-RoboTwin\\task_config",
+    "checkpoint": null,
+    "wan_config": null,
+    "wan_vae": null,
+    "wan_t5": null,
+    "wan_tokenizer": null,
+    "vlm": null
+  },
+  "errors": [
+    "Missing shared_interpreter: C:\\Users\\Kevin\\Personal\\Research\\Robotics Research\\uv_envs\\robotwin-classic\\Scripts\\python.exe",
+    "Missing checkpoint: None",
+    "Missing wan_config: None",
+    "Missing wan_vae: None",
+    "Missing wan_t5: None",
+    "Missing wan_tokenizer: None",
+    "Missing vlm: None",
+    "task_config is not a directory: restore Git symlinks in a Linux checkout"
+  ],
+  "runtime_unverified": [
+    "CUDA and VRAM",
+    "Motus dependencies in selected shared environment",
+    "simulator assets/rendering",
+    "checkpoint compatibility"
+  ],
+  "timing_constraint": "TOPP target duration varies; speed_factor > 1 cannot use a fixed execution clock"
+}

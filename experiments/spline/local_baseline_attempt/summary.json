@@ -1,0 +1,5 @@
+{
+  "rollouts": [],
+  "phase1_complete": false,
+  "training_gate": "closed: full matched six-variant experiment required"
+}
