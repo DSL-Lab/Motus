@@ -117,6 +117,11 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
+    if q.device.type == 'cpu':
+        return _xpu_scaled_dot_product_attention(
+            q, k, v, q_lens=q_lens, k_lens=k_lens, dropout_p=dropout_p,
+            softmax_scale=softmax_scale, q_scale=q_scale, causal=causal,
+            window_size=window_size, dtype=torch.float32)
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type in ('cuda', 'xpu') and q.size(-1) <= 256
