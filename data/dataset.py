@@ -335,7 +335,5 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
 
     if initial_states is not None:
         result['initial_state'] = initial_states
-    if all('video_frame_valid' in sample for sample in batch):
-        result['video_frame_valid'] = torch.stack([sample['video_frame_valid'] for sample in batch])
     
     return result

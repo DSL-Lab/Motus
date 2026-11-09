@@ -1,6 +1,0 @@
-/runs/
-# Generated machine-specific preflight, test, and submission reports.
-/checks/
-# One-off TCP reconstruction analysis, helpers, and generated reports.
-/offline_tcp/
-*.npz

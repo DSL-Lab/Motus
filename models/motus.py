@@ -109,9 +109,6 @@ class VideoModule(nn.Module):
         """Prepare video tokens from pre-processed noisy latent."""
         # Through patch_embedding: 48 -> 3072 channels
         video_patched = self.video_model.wan_model.patch_embedding(noisy_video_latent)
-        # Batch size and latent grid can differ between training and inference.
-        self.grid_sizes = torch.tensor(video_patched.shape[2:], device=video_patched.device,
-                                       dtype=torch.long).unsqueeze(0).expand(video_patched.shape[0], -1)
 
         # Flatten and convert to tokens
         video_features = video_patched.flatten(2).transpose(1, 2)
@@ -170,7 +167,7 @@ class VideoModule(nn.Module):
                 self.video_model.wan_model.freq_dim, t_flat
             ).unflatten(0, (bt, seq_len)).to(dtype=embedding_dtype)
             t_emb = time_embedding(sinusoidal_embedding)
-            t_emb_proj = self.video_model.wan_model.time_projection(t_emb).unflatten(2, (6, self.video_model.wan_model.dim))
+            t_emb_proj = self.video_model.wan_model.time_projection(t_emb).unflatten(2, (6, 3072))
 
         return t_emb.float(), t_emb_proj
 
@@ -222,7 +219,6 @@ class VideoModule(nn.Module):
         action_block: nn.Module,
         und_tokens: torch.Tensor,
         und_block: nn.Module,
-        video_key_valid: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Trimodal joint self-attention: WAN + Action + Understanding via WAN self-attn (MoT)."""
         wan_layer = self.video_model.wan_model.blocks[layer_idx]
@@ -243,8 +239,6 @@ class VideoModule(nn.Module):
 
         # Action heads for WAN space (1024 -> 24*128)
         a_qkv = torch.einsum("BTD,KNDE->KBTNE", norm_action, action_block.wan_action_qkv)
-        if hasattr(action_block, 'wan_action_lora'):
-            a_qkv = a_qkv + action_block.wan_action_lora(norm_action)
         a_q_h, a_k_h, a_v_h = a_qkv[0], a_qkv[1], a_qkv[2]
         a_q = action_block.wan_action_norm_q(a_q_h.flatten(-2)).view(B, L_a, n, d)
         a_k = action_block.wan_action_norm_k(a_k_h.flatten(-2)).view(B, L_a, n, d)
@@ -271,8 +265,7 @@ class VideoModule(nn.Module):
         y, action_out_h, und_out_h = wan_layer.self_attn(
             norm_video, seq_lens, self.grid_sizes, freqs,
             action_q=a_q, action_k=a_k, action_v=a_v,
-            und_q=u_q, und_k=u_k, und_v=u_v,
-            video_key_valid=video_key_valid,
+            und_q=u_q, und_k=u_k, und_v=u_v
         )
         
         # Project Understanding Expert output
@@ -780,8 +773,7 @@ class Motus(nn.Module):
         actions: torch.Tensor = None,     # [B, chunk_size, action_dim] - actions
         language_embeddings: Optional[List[torch.Tensor]] = None,  # Pre-encoded T5 embeddings for WAN
         vlm_inputs: Optional[List] = None,  # Complete VLM inputs from dataset
-        return_dict: bool = True,
-        video_frame_valid: Optional[torch.Tensor] = None,
+        return_dict: bool = True
     ) -> Dict[str, torch.Tensor]:
         """
         UniDiffuser training step with three modalities.
@@ -828,15 +820,6 @@ class Motus(nn.Module):
 
         # Latent to Tokens
         video_tokens = self.video_module.prepare_input(noisy_video_latent.to(self.dtype))
-        video_key_valid = None
-        latent_valid = None
-        if video_frame_valid is not None:
-            from motus_actions.temporal import latent_video_validity
-            latent_valid = latent_video_validity(video_frame_valid.to(video_tokens.device))
-            if latent_valid.shape[1] != clean_full_latent.shape[2]:
-                raise ValueError("RGB validity and actual VAE temporal grid disagree")
-            spatial_tokens = int(self.video_module.grid_sizes[0, 1:].prod())
-            video_key_valid = latent_valid.repeat_interleave(spatial_tokens, dim=1)
 
         # 2. Action pipeline 
         timestep_id_action = torch.randint(0, self.fm_train_scheduler_action.num_train_timesteps, (B,))
@@ -881,7 +864,7 @@ class Motus(nn.Module):
                 video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
                     video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
                     self.action_expert.blocks[layer_idx],
-                    und_tokens, self.und_expert.blocks[layer_idx], video_key_valid=video_key_valid,
+                    und_tokens, self.und_expert.blocks[layer_idx]
                 )
 
                 # WAN cross
@@ -907,9 +890,6 @@ class Motus(nn.Module):
             video_pred_masked = video_pred.clone()
             video_pred_masked[:, :, 0:1] = 0
             video_loss = torch.nn.functional.mse_loss(video_pred_masked, video_target, reduction='mean')
-            if latent_valid is not None:
-                from motus_actions.temporal import masked_video_loss
-                video_loss = masked_video_loss(video_pred, video_target, latent_valid)
         
             # Action loss
             action_loss = torch.nn.functional.mse_loss(action_pred, action_target, reduction='mean')
@@ -934,8 +914,7 @@ class Motus(nn.Module):
         state: torch.Tensor = None,
         num_inference_steps: int = 50,
         language_embeddings: Optional[List[torch.Tensor]] = None,
-        vlm_inputs: Optional[List] = None,
-        decode_rgb: bool = True,
+        vlm_inputs: Optional[List] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Joint inference for video and action prediction.
@@ -1043,13 +1022,11 @@ class Motus(nn.Module):
                 video_latent[:, :, 0:1] = condition_frame_latent
 
         # 4. Decode outputs
-        predicted_frames = None
-        if decode_rgb:
-            with torch.no_grad():
-                decoded_frames = self.video_model.decode_video(video_latent)
-                predicted_frames = decoded_frames[:, :, 1:]  # Skip first frame (condition)
-                predicted_frames = (predicted_frames + 1.0) / 2.0  # [-1,1] to [0,1]
-                predicted_frames = torch.clamp(predicted_frames, 0, 1).float()
+        with torch.no_grad():
+            decoded_frames = self.video_model.decode_video(video_latent)
+            predicted_frames = decoded_frames[:, :, 1:]  # Skip first frame (condition)
+            predicted_frames = (predicted_frames + 1.0) / 2.0  # [-1,1] to [0,1]
+            predicted_frames = torch.clamp(predicted_frames, 0, 1).float()
         
         predicted_actions = action_latent.float()  # [B, action_chunk_size, 14]
 

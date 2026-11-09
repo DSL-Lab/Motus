@@ -173,8 +173,7 @@ class WanSelfAttention(nn.Module):
                 action_v: torch.Tensor = None,
                 und_q: torch.Tensor = None,
                 und_k: torch.Tensor = None,
-                und_v: torch.Tensor = None,
-                video_key_valid: torch.Tensor = None):
+                und_v: torch.Tensor = None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -231,22 +230,12 @@ class WanSelfAttention(nn.Module):
             k_cat = torch.cat(k_parts, dim=1)
             v_cat = torch.cat(v_parts, dim=1)
 
-            if video_key_valid is None:
-                attn_out = flash_attention(
-                    q=q_cat, k=k_cat, v=v_cat, k_lens=seq_lens,
-                    window_size=self.window_size)
-            else:
-                # Padding is a key mask only; keep all queries for fixed shapes.
-                # Joint attention stays differentiable through frozen video weights.
-                if video_key_valid.shape != (b, L_x) or self.window_size != (-1, -1):
-                    raise ValueError("Spline video mask requires the full joint attention grid")
-                key_valid = torch.cat((video_key_valid, torch.ones(
-                    (b, L_action + L_und), device=x.device, dtype=torch.bool)), dim=1)
-                attn_out = torch.nn.functional.scaled_dot_product_attention(
-                    q_cat.transpose(1, 2).to(v_cat.dtype),
-                    k_cat.transpose(1, 2).to(v_cat.dtype),
-                    v_cat.transpose(1, 2), attn_mask=key_valid[:, None, None, :]
-                ).transpose(1, 2)
+            attn_out = flash_attention(
+                q=q_cat,
+                k=k_cat,
+                v=v_cat,
+                k_lens=seq_lens,
+                window_size=self.window_size)
 
             # Split outputs back to respective modalities
             x_out = attn_out[:, :L_x, :, :]

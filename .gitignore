@@ -231,11 +231,3 @@ datasets/*
 scripts_new/
 scripts/run_local.sh
 scripts/manual_multi_node_srun.sh
-
-# Local inference dependencies and downloaded model assets.
-/.runtime/
-/pretrained_models/
-
-# Local scheduler stdout/stderr, including custom Slurm job names.
-/*.out
-/*.err
