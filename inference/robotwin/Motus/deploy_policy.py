@@ -106,7 +106,9 @@ class MotusPolicy:
         # Load checkpoint weights
         try:
             logger.info(f"Loading checkpoint from {self.checkpoint_path}")
-            model.load_checkpoint(self.checkpoint_path, strict=False)
+            # This wrapper constructs every backbone from configuration. Missing
+            # tensors would therefore leave random frozen weights at deployment.
+            model.load_checkpoint(self.checkpoint_path, strict=True)
             logger.info("Model checkpoint loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
@@ -180,8 +182,14 @@ class MotusPolicy:
                 left_img = obs_data['left_camera']['rgb']
                 right_img = obs_data['right_camera']['rgb']
                 
-                left_img_resized = cv2.resize(left_img, (160, 120))
-                right_img_resized = cv2.resize(right_img, (160, 120))
+                # Match the recording converter's head/left/right layout for
+                # the actual camera resolution, rather than assuming 320x240.
+                head_height, head_width = head_img.shape[:2]
+                if head_width % 2:
+                    raise ValueError("Three-view composition requires an even head-camera width")
+                wrist_size = (head_width // 2, head_height // 2)
+                left_img_resized = cv2.resize(left_img, wrist_size)
+                right_img_resized = cv2.resize(right_img, wrist_size)
                 bottom_row = np.concatenate([left_img_resized, right_img_resized], axis=1)
                 image = np.concatenate([head_img, bottom_row], axis=0)
             else:
@@ -204,9 +212,17 @@ class MotusPolicy:
         if image_tensor.shape[-2:] != target_size:
             image_np = image_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
             resized_np = resize_with_padding(image_np, target_size)
-            if resized_np.dtype == np.uint8:
-                resized_np = resized_np.astype(np.float32) / 255.0
             image_tensor = torch.from_numpy(resized_np).permute(2, 0, 1).unsqueeze(0)
+
+        # The dataset always emits floating RGB in [0,1], including when no
+        # resize is necessary. Previously already-sized uint8 input bypassed
+        # conversion and reached the VAE in [0,255].
+        if image_tensor.dtype == torch.uint8:
+            image_tensor = image_tensor.float() / 255.0
+        else:
+            image_tensor = image_tensor.float()
+        if not torch.isfinite(image_tensor).all() or image_tensor.min() < 0 or image_tensor.max() > 1:
+            raise ValueError("Expected finite RGB observations in [0,1] or uint8 [0,255]")
         
         self.obs_cache.append(image_tensor.to(self.device))
 
