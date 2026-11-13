@@ -231,3 +231,8 @@ datasets/*
 scripts_new/
 scripts/run_local.sh
 scripts/manual_multi_node_srun.sh
+# A/C experiment artifacts (source/configuration live in tracked directories)
+outputs/
+.runtime/
+pretrained_models/
+/docs/snapshots

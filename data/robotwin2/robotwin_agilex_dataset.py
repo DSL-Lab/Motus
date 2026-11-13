@@ -70,6 +70,8 @@ class RobotWinTaskDataset(data.Dataset):
         
         # VLM processing parameters
         vlm_checkpoint_path: Optional[str] = None,  # Path to VLM model
+        episode_manifest: Optional[str] = None,
+        action_representation: str = "dense",
     ):
         """
         Initialize RobotWin dataset with flexible sampling.
@@ -150,8 +152,48 @@ class RobotWinTaskDataset(data.Dataset):
         else:
             logger.info("VLM checkpoint path not provided, VLM processing disabled")
 
-        # Load dataset episodes
-        self._load_episodes()
+        # An experiment manifest supplies a shared episode split and eligible
+        # observations. The original folder-based path remains the default.
+        self.action_representation = action_representation
+        self.episode_manifest = episode_manifest
+        if episode_manifest:
+            from motus_actions.spline import AffineScale, VERSION
+            from motus_actions.prepare import digest
+            manifest = json.loads(Path(episode_manifest).read_text())
+            from utils.robotwin_prompt import CONDITIONING
+            if manifest.get('conditioning') != CONDITIONING:
+                raise ValueError('legacy raw-instruction manifest; prepare a new scene-prefixed language cache')
+            import hashlib
+            identity_data = {k: v for k, v in manifest.items() if k != 'identity'}
+            if manifest['identity'] != hashlib.sha256(json.dumps(identity_data, sort_keys=True).encode()).hexdigest():
+                raise ValueError('manifest identity changed; regenerate cache')
+            if manifest['version'] != VERSION:
+                raise ValueError("stale spline cache version")
+            spline_path = Path(__file__).resolve().parents[2] / 'motus_actions/spline.py'
+            converter_path = spline_path.with_name('prepare.py')
+            if manifest['converter_sha256'] != digest(converter_path):
+                raise ValueError('converter changed; regenerate cache')
+            if manifest['spline_sha256'] != digest(spline_path):
+                raise ValueError("spline source changed; regenerate cache")
+            self.parameter_scale = AffineScale(manifest['parameter_low'], manifest['parameter_high'])
+            ids = manifest['split']['validation' if val else 'train']
+            self.episode_files = [e for e in manifest['episodes'] if e['id'] in ids]
+            if task_name:
+                self.episode_files = [e for e in self.episode_files if e['task_name'] == task_name]
+            if not self.episode_files:
+                raise ValueError("empty manifest split")
+            self.task_to_episodes = {}
+            for episode in self.episode_files:
+                self.task_to_episodes.setdefault(episode['task_name'], []).append(episode)
+            for episode in self.episode_files:
+                raw = Path(episode['hdf5_path']).stat()
+                if raw.st_size != episode['bytes'] or raw.st_mtime_ns != episode['mtime_ns']:
+                    raise ValueError('raw dataset changed; regenerate cache')
+            self.total_episodes = len(self.episode_files)
+        else:
+            if action_representation != 'dense':
+                raise ValueError("spline targets require a prepared episode manifest")
+            self._load_episodes()
     
     def _limit_episodes_first_n(self, episodes: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
         """
@@ -464,6 +506,8 @@ class RobotWinTaskDataset(data.Dataset):
         Returns:
             Dictionary containing training data
         """
+        if self.episode_manifest:
+            return self._manifest_sample()
         # Robust sampling with retries to avoid returning None (which breaks DDP sync)
         max_attempts = 8
         for _ in range(max_attempts):
@@ -543,3 +587,36 @@ class RobotWinTaskDataset(data.Dataset):
 
         # If all attempts failed, let caller drop this sample (rare)
         return None
+
+    def _manifest_sample(self):
+        from motus_actions.prepare import read_frames
+        from utils.robotwin_prompt import robotwin_prompt
+        task = random.choice(sorted(self.task_to_episodes))
+        episode = random.choice(self.task_to_episodes[task])
+        with np.load(episode['cache_path'], allow_pickle=False) as cached:
+            slot = random.randrange(len(cached['observations']))
+            current = int(cached['observations'][slot])
+            if self.action_representation == 'spline':
+                actions = self.parameter_scale.encode(cached['windows'][slot])
+                targets = cached['video_indices'][slot]
+            else:
+                action_indices = current + np.arange(1, self.action_chunk_size + 1) * self.global_downsample_rate
+                actions = cached['actions'][action_indices]
+                targets = action_indices[self.video_action_freq_ratio - 1::self.video_action_freq_ratio]
+            state = torch.from_numpy(cached['states'][current].copy()).float()
+        images = read_frames(episode['hdf5_path'], np.r_[current, targets], self.video_size)
+        images = torch.from_numpy(images).permute(0, 3, 1, 2).float() / 255
+        instruction = robotwin_prompt(episode['instruction'])
+        import hashlib
+        language_file = Path(self.episode_manifest).parent / 'language' / (hashlib.sha256(instruction.encode()).hexdigest() + '.pt')
+        if not language_file.exists():
+            raise ValueError('missing scene-prefixed T5 cache; run prepare --language-from-manifest in a new output directory')
+        embedding = torch.load(language_file, map_location='cpu', weights_only=True)
+        vlm_inputs = None
+        if self.vlm_processor is not None:
+            vlm_inputs = preprocess_vlm_messages(instruction, tensor_to_pil(images[0]), self.vlm_processor)
+        return {'first_frame': images[0], 'video_frames': images[1:],
+                'initial_state': state, 'action_sequence': torch.from_numpy(actions.copy()).float(),
+                'language_embedding': embedding, 'vlm_inputs': vlm_inputs,
+                'text_instruction': instruction, 'episode_id': episode['id'],
+                'observation_index': current}

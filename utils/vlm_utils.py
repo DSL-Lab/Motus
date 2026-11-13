@@ -1,7 +1,13 @@
 # VLM Utilities
 # Simple functions for VLM data preprocessing
 
-from qwen_vl_utils import process_vision_info
+from importlib.util import find_spec
+
+# Reuse the repository's vendored implementation in the offline container.
+if find_spec('qwen_vl_utils') is None:
+    from bak.wan.utils.qwen_vl_utils import process_vision_info
+else:
+    from qwen_vl_utils import process_vision_info
 from typing import List, Dict, Any, Tuple
 import logging
 

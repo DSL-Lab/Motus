@@ -1,0 +1,109 @@
+{
+  "task_name": "place_can_basket",
+  "task_config": "demo_clean",
+  "task_config_sha256": "3acfcd508078a51e3a48fd7e2f6e61c1b9a6ced0cc44dedd149b55114248e2ab",
+  "suite_role": "validation",
+  "seed_provenance": "Predeclared diagnostic seeds; clean demonstration and pretrained scene overlap unknown",
+  "cases": [
+    {
+      "seed": 100000,
+      "policy_seed": 700000,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100001,
+      "policy_seed": 700001,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100002,
+      "policy_seed": 700002,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100003,
+      "policy_seed": 700003,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100004,
+      "policy_seed": 700004,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100005,
+      "policy_seed": 700005,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100006,
+      "policy_seed": 700006,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100007,
+      "policy_seed": 700007,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100008,
+      "policy_seed": 700008,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100009,
+      "policy_seed": 700009,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100010,
+      "policy_seed": 700010,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100011,
+      "policy_seed": 700011,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100012,
+      "policy_seed": 700012,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100013,
+      "policy_seed": 700013,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100014,
+      "policy_seed": 700014,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100015,
+      "policy_seed": 700015,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100016,
+      "policy_seed": 700016,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100017,
+      "policy_seed": 700017,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100018,
+      "policy_seed": 700018,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    },
+    {
+      "seed": 100019,
+      "policy_seed": 700019,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    }
+  ]
+}

@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
 import warnings
+from contextlib import nullcontext
 
 # Set CUDA memory management environment variables to avoid fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -20,10 +21,8 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
-import wandb
 from accelerate import Accelerator
-from accelerate.utils import DeepSpeedPlugin, ProjectConfiguration
+from accelerate.utils import DeepSpeedPlugin, ProjectConfiguration, GradientAccumulationPlugin
 import yaml
 from omegaconf import OmegaConf
 from datetime import datetime
@@ -37,6 +36,25 @@ from utils.scheduler import create_scheduler
 from sample import evaluate_model, log_evaluation_metrics
 
 logger = logging.getLogger(__name__)
+
+
+def create_accelerator(accumulation_steps=1, **kwargs):
+    # DataLoader.drop_last only drops a partial *microbatch*. Carry gradients
+    # over epoch boundaries so a 450-batch epoch cannot flush a 2-example update.
+    return Accelerator(gradient_accumulation_plugin=GradientAccumulationPlugin(
+        num_steps=accumulation_steps, sync_with_dataloader=False), **kwargs)
+
+
+def prepare_pilot_training(accelerator,model,optimizer,loader,scheduler):
+    """Keep the serial pilot loader free of Accelerate's unsaved lookahead.
+
+    DataLoaderShard fetches the next random example before yielding this one.
+    The raw loader plus the saved epoch generator/cursor permits exact resume.
+    """
+    if accelerator.num_processes!=1 or loader.num_workers!=0:
+        raise ValueError('the resumable A/C pilot requires one process and num_workers=0')
+    model,optimizer,scheduler=accelerator.prepare(model,optimizer,scheduler)
+    return model,optimizer,loader,scheduler
 
 def setup_logging(rank: int = 0, log_level: str = "INFO"):
     """Setup logging configuration."""
@@ -115,7 +133,7 @@ class UniDiffuserTrainer:
         save_interval: int = 1000,
         val_interval: int = 1000,
         report_to: str = "wandb",
-        tb_writer: Optional[SummaryWriter] = None,
+        tb_writer: Optional[Any] = None,
         accelerator: Optional[Any] = None,
         config: Optional[Any] = None,
     ):
@@ -145,17 +163,33 @@ class UniDiffuserTrainer:
         # Initialize tracking variables
         self.global_step = 0
         self.epoch = 0
+        self.batches_in_epoch = 0
+        self.pending_examples = 0
+        self.pending_microbatches = 0
+        self.epoch_generator_state = None
+        self.update_records = []
         
         logger.info(f"Motus Trainer initialized on rank {rank}/{world_size}")
         logger.info(f"Logging backends: {report_to}")
 
     def save_checkpoint(self, suffix: str = ""):
         """Save complete training state using accelerator."""
+        if self.pending_microbatches or not self.accelerator.sync_gradients:
+            raise ValueError('checkpoint requires a completed optimizer update; partial gradients are not saved')
         checkpoint_dir = self.checkpoint_dir / f"checkpoint_step_{self.global_step}{suffix}"
         
         # Use accelerator to save complete training state
         # This saves model, optimizer, scheduler, dataloader, and RNG states
         self.accelerator.save_state(str(checkpoint_dir))
+        if self.rank == 0:
+            if self.config is not None:
+                OmegaConf.save(self.config, checkpoint_dir / "resolved_config.yaml")
+            (checkpoint_dir / "trainer_state.json").write_text(json.dumps({
+                "global_step": self.global_step, "epoch": self.epoch,
+                "batches_in_epoch": self.batches_in_epoch,
+                "accumulation_boundary": True,
+                "accumulation_steps": self.accelerator.gradient_accumulation_steps,
+                "epoch_generator_state": self.epoch_generator_state.tolist() if self.epoch_generator_state is not None else None}))
         logger.info(f"Checkpoint saved to {checkpoint_dir}")
         # Also save a config.json alongside weights for reproducibility
         try:
@@ -191,6 +225,14 @@ class UniDiffuserTrainer:
             return
             
         logger.info(f"Loading checkpoint from {checkpoint_path}")
+        if self.config.training.get('lora', False):
+            recorded = OmegaConf.load(Path(checkpoint_path) / 'resolved_config.yaml')
+            for section, keys in [('common', ['action_representation']),
+                                  ('dataset', ['conditioning', 'episode_manifest']),
+                                  ('training', ['batch_size', 'gradient_accumulation_steps', 'max_steps', 'warmup_steps', 'lora_rank', 'lora_alpha'])]:
+                for key in keys:
+                    if recorded[section].get(key) != self.config[section].get(key):
+                        raise ValueError(f'incompatible resume configuration: {section}.{key}')
 
         # Extract step number from checkpoint path (e.g., checkpoint_step_125000)
         step_match = re.search(r'step_(\d+)', checkpoint_path)
@@ -202,6 +244,21 @@ class UniDiffuserTrainer:
 
         # Load using accelerator (includes model, optimizer, scheduler states)
         self.accelerator.load_state(checkpoint_path)
+        state_path = Path(checkpoint_path) / 'trainer_state.json'
+        if self.config.training.get('lora', False):
+            state = json.loads(state_path.read_text())
+            if not state.get('accumulation_boundary'):
+                raise ValueError('legacy checkpoint lacks a verified accumulation boundary; diagnostic weights only')
+            if state['accumulation_steps'] != self.accelerator.gradient_accumulation_steps:
+                raise ValueError('resume accumulation factor differs from checkpoint')
+            self.global_step = state['global_step']
+            self.epoch = state['epoch']
+            self.batches_in_epoch = state['batches_in_epoch']
+            generator_state = state.get('epoch_generator_state')
+            self.epoch_generator_state = torch.tensor(generator_state, dtype=torch.uint8) if generator_state is not None else None
+            # Checkpoints are safe update boundaries; Accelerate does not save
+            # its accumulation phase. Start the next complete group explicitly.
+            self.accelerator.step = 0
         logger.info(f"Checkpoint loaded successfully from {checkpoint_path}")
         
         # Reset scheduler with new config if requested
@@ -270,7 +327,8 @@ class UniDiffuserTrainer:
     def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
         """Single training step for UniDiffuser."""
         self.model.train()
-        self.optimizer.zero_grad()
+        # Accelerator scales loss and suppresses optimizer steps on microbatches.
+        # zero_grad happens after the synchronized optimizer update.
         
         first_frame = batch['first_frame'].to(self.device, dtype=self.dtype)          # [B, C, H, W]
         video_frames = batch['video_frames'].to(self.device, dtype=self.dtype)        # [B, num_video_frames, C, H, W]
@@ -302,6 +360,8 @@ class UniDiffuserTrainer:
         )
         
         total_loss = loss_dict['total_loss']
+        if not torch.isfinite(total_loss):
+            raise ValueError('nonfinite training loss')
         
         # Backward pass (using accelerator if available)
         if hasattr(self, 'accelerator') and self.accelerator is not None:
@@ -311,13 +371,33 @@ class UniDiffuserTrainer:
         
         # Gradient clipping
         grad_clip_norm = self.config.training.grad_clip_norm if hasattr(self.config.training, 'grad_clip_norm') else 1.0
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
+        sync_gradients = self.accelerator is None or self.accelerator.sync_gradients
+        if sync_gradients:
+            if self.config.training.get('lora', False) and self.global_step == 0:
+                required = [(name, p) for name, p in self.model.named_parameters() if p.requires_grad]
+                missing = [name for name, p in required if p.grad is None]
+                nonfinite = [name for name, p in required if p.grad is not None and not torch.isfinite(p.grad).all()]
+                if missing or nonfinite:
+                    raise ValueError(f'gradient audit: missing={missing}; nonfinite={nonfinite}')
+                groups = {}
+                for name, parameter in required:
+                    component = 'action_projection' if ('action_encoder' in name or 'action_head' in name) else (
+                        'action_attention' if 'wan_action' in name else 'video_attention')
+                    groups.setdefault(component, []).append(parameter.grad.detach().float().norm())
+                self.last_gradient_audit = {name: float(torch.linalg.vector_norm(torch.stack(norms))) for name,norms in groups.items()}
+                if self.rank == 0:
+                    (self.checkpoint_dir/'gradient_audit.json').write_text(json.dumps(self.last_gradient_audit,indent=2)+'\n')
+            if self.accelerator is not None:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
         
         # Optimizer step
         self.optimizer.step()
         
-        if self.scheduler:
+        if self.scheduler and sync_gradients:
             self.scheduler.step()
+        self.optimizer.zero_grad()
         
         # Convert to float for logging
         metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
@@ -342,39 +422,75 @@ class UniDiffuserTrainer:
                 if self.config is not None and hasattr(self.config, 'resume') and hasattr(self.config.resume, 'reset_scheduler'):
                     reset_scheduler = bool(self.config.resume.reset_scheduler)
                 else:
-                    reset_scheduler = True  # Default behavior
+                    reset_scheduler = not self.config.training.get("lora", False)
             
             self.load_checkpoint(resume_from, reset_scheduler=reset_scheduler)
         
         logger.info(f"Starting UniDiffuser training for {max_steps} steps")
         
         start_time = time.time()
+        self.optimizer.zero_grad()
         
         # Step-based training loop
-        data_iter = iter(self.train_dataloader)
-        epoch = 0
+        generator = getattr(self.train_dataloader, 'generator', None)
+        if self.epoch_generator_state is not None and generator is not None:
+            generator.set_state(self.epoch_generator_state)
+        if generator is not None:
+            self.epoch_generator_state = generator.get_state().clone()
+        if self.batches_in_epoch:
+            data_iter = iter(self.accelerator.skip_first_batches(self.train_dataloader, self.batches_in_epoch))
+        else:
+            data_iter = iter(self.train_dataloader)
+        epoch = self.epoch
+        if self.accelerator is not None and self.accelerator.gradient_accumulation_steps > 1:
+            if self.accelerator.gradient_state.sync_with_dataloader:
+                raise ValueError('use create_accelerator: accumulation must continue across epoch boundaries')
         
+        accumulation_start = None
         while self.global_step < max_steps:
+            if accumulation_start is None:
+                accumulation_start = time.perf_counter()
             try:
                 batch = next(data_iter)
             except StopIteration:
                 # End of epoch, restart dataloader
                 epoch += 1
+                self.epoch = epoch
+                self.batches_in_epoch = 0
                 if hasattr(self.train_dataloader.sampler, 'set_epoch'):
                     self.train_dataloader.sampler.set_epoch(epoch)
+                if generator is not None:
+                    self.epoch_generator_state = generator.get_state().clone()
                 data_iter = iter(self.train_dataloader)
                 batch = next(data_iter)
             
             if batch is None:  # Handle None batches
-                continue
+                raise ValueError('empty microbatch would change the effective batch size')
+            self.batches_in_epoch += 1
+            self.pending_examples += len(batch['action_sequence']) * self.world_size
+            self.pending_microbatches += 1
                 
-            step_start_time = time.time()
-
             # Training step
-            metrics = self.train_step(batch)
+            with self.accelerator.accumulate(self.model) if self.accelerator is not None else nullcontext():
+                metrics = self.train_step(batch)
+            if self.accelerator is not None and not self.accelerator.sync_gradients:
+                continue
             
-            step_time = time.time() - step_start_time
+            step_time = time.perf_counter() - accumulation_start
+            accumulation_start = None
             self.global_step += 1
+            expected = int(self.config.training.get('batch_size', 1)) * self.world_size * (
+                self.accelerator.gradient_accumulation_steps if self.accelerator is not None else 1)
+            if self.pending_examples != expected:
+                raise ValueError(f'optimizer update used {self.pending_examples} examples; expected {expected}')
+            record = dict(global_step=self.global_step, epoch=epoch,
+                          examples=self.pending_examples, microbatches=self.pending_microbatches,
+                          optimizer_steps=self.global_step, scheduler_steps=self.global_step if self.scheduler else 0)
+            self.update_records.append(record)
+            if self.rank == 0:
+                with (self.checkpoint_dir / 'updates.jsonl').open('a') as handle:
+                    handle.write(json.dumps(record) + '\n')
+            self.pending_examples = self.pending_microbatches = 0
             
             # Logging
             if self.global_step % self.log_interval == 0 and self.rank == 0:
@@ -435,7 +551,8 @@ class UniDiffuserTrainer:
         total_time = time.time() - start_time
         if self.rank == 0:
             logger.info(f"UniDiffuser training completed in {total_time:.2f}s ({self.global_step} steps)")
-            self.save_checkpoint()
+            if self.global_step % self.save_interval != 0:
+                self.save_checkpoint()
 
 def create_model_and_optimizer(config: OmegaConf) -> tuple:
     """Create UniDiffuser model and optimizer from config."""
@@ -448,6 +565,7 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple:
         video_precision=config.model.wan.precision,
         action_state_dim=config.common.state_dim,
         action_dim=config.common.action_dim,
+        action_representation=config.common.get("action_representation", "dense"),
         # Action Expert configuration from config file
         action_expert_dim=config.model.action_expert.hidden_size,
         action_expert_ffn_dim_multiplier=config.model.action_expert.ffn_dim_multiplier,
@@ -474,6 +592,26 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple:
     # Create model (Accelerator will handle device placement and DDP)
     model = Motus(model_config)
     
+    if config.training.get('lora', False):
+        from utils.lora import configure_lora, parameter_groups, load_initial_weights
+        output = Path(config.system.checkpoint_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        load_initial_weights(model, config.finetune.checkpoint_path, output / 'checkpoint_load.json')
+        # Adapter initialization must not depend on representation-specific
+        # projection shapes or how much RNG model construction consumed.
+        with torch.random.fork_rng():
+            torch.manual_seed(int(config.training.get('seed', 0)))
+            summary = configure_lora(model,rank=int(config.training.get('lora_rank',16)),
+                                     alpha=float(config.training.get('lora_alpha',32)))
+        groups = parameter_groups(model, lr=float(config.training.learning_rate),
+                                  weight_decay=float(config.training.weight_decay))
+        summary['optimizer_groups'] = [{k: v for k, v in group.items() if k != 'params'} | {
+            'parameters': sum(p.numel() for p in group['params'])} for group in groups]
+        (output / 'trainable_summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+        logger.info('LoRA summary: %s', json.dumps(summary))
+        optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.999), eps=1e-8)
+        return model, optimizer, create_scheduler(optimizer, config)
+
     # Optimizer - parameter groups for separate WAN (video model) learning rate
     base_lr = float(config.training.learning_rate)
     wan_lr = float(getattr(config.training, 'wan_learning_rate', base_lr))
@@ -523,6 +661,7 @@ def create_dataloaders(config: OmegaConf, rank: int, world_size: int) -> tuple:
         num_workers=config.system.num_workers,
         pin_memory=config.system.pin_memory,
         collate_fn=collate_fn,
+        generator=torch.Generator().manual_seed(int(config.training.get("seed", 0))),
         drop_last=True,
     )
     
@@ -534,6 +673,7 @@ def create_dataloaders(config: OmegaConf, rank: int, world_size: int) -> tuple:
         num_workers=config.system.num_workers,
         pin_memory=config.system.pin_memory,
         collate_fn=collate_fn,
+        generator=torch.Generator().manual_seed(int(config.training.get("seed", 0)) + 1),
         drop_last=False,
     )
     
@@ -562,10 +702,32 @@ def main():
     parser.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config file")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
     
+    parser.add_argument('--representation', choices=['A', 'C'])
+    parser.add_argument('--seed', type=int)
+    parser.add_argument('--max_steps', type=int)
+    parser.add_argument('--resume', type=str)
+    parser.add_argument('--lora_rank', type=int)
+    parser.add_argument('--episode_manifest', type=str)
     args = parser.parse_args()
     
     # Load configuration
     config = load_config(args.config)
+    if args.representation:
+        if not config.training.get('lora', False):
+            raise ValueError('A/C comparison requires the matched LoRA recipe')
+        config.common.action_representation = 'dense' if args.representation == 'A' else 'spline'
+    if args.seed is not None:
+        config.training.seed = args.seed
+    if args.max_steps is not None:
+        config.training.max_steps = args.max_steps
+    if args.resume:
+        config.resume.checkpoint_path = args.resume
+    if args.lora_rank is not None:
+        config.training.lora_rank = args.lora_rank
+    if args.episode_manifest is not None:
+        config.dataset.episode_manifest = args.episode_manifest
+    from accelerate.utils import set_seed
+    set_seed(int(config.training.get("seed", 0)))
     if args.checkpoint_dir is not None:
         config.system.checkpoint_dir = args.checkpoint_dir
     if args.report_to is not None:
@@ -596,13 +758,13 @@ def main():
     
     # Initialize Accelerator with DeepSpeed (if provided)
     accelerator_project_config = ProjectConfiguration(total_limit=20)
-    accelerator = Accelerator(
+    accelerator = create_accelerator(
+        accumulation_steps=config.training.get('gradient_accumulation_steps', 1),
         deepspeed_plugin=DeepSpeedPlugin(
             hf_ds_config=args.deepspeed
         ) if args.deepspeed is not None else None,
-        gradient_accumulation_steps=config.training.get('gradient_accumulation_steps', 1),
         mixed_precision="bf16",
-        log_with=config.logging.get('report_to', 'tensorboard'),
+        log_with=None if config.logging.get('report_to') == 'none' else config.logging.get('report_to', 'tensorboard'),
         project_dir=config.system.checkpoint_dir,
         project_config=accelerator_project_config,
     )
@@ -634,6 +796,7 @@ def main():
     # Initialize TensorBoard writer
     tb_writer = None
     if rank == 0 and "tensorboard" in report_to:
+        from torch.utils.tensorboard import SummaryWriter
         tb_log_dir = os.path.join(config.system.checkpoint_dir, config.logging.tensorboard_log_dir)
         tb_writer = SummaryWriter(log_dir=tb_log_dir)
         logger.info(f"TensorBoard logs will be saved to: {tb_log_dir}")
@@ -642,6 +805,8 @@ def main():
     
     # Initialize WandB
     if rank == 0 and "wandb" in report_to:
+        global wandb
+        import wandb
         wandb.init(
             project=config.logging.wandb_project,
             config=OmegaConf.to_container(config, resolve=True),
@@ -655,7 +820,7 @@ def main():
 
         # Optional: load finetune weights for partial init
         finetune_ckpt = getattr(config.finetune, 'checkpoint_path', None) if hasattr(config, 'finetune') else None
-        if getattr(config, 'training_mode', 'finetune') == 'finetune' and finetune_ckpt:
+        if getattr(config, 'training_mode', 'finetune') == 'finetune' and finetune_ckpt and not config.training.get('lora', False):
             logger.info(f"Loading finetune weights from {finetune_ckpt} (partial)...")
             try:
                 (model.module if hasattr(model, 'module') else model).load_pretrain_weights(finetune_ckpt)
@@ -682,13 +847,17 @@ def main():
                     logger.info(f"Model {i} saved to {model_save_path}")
         
         # Register the custom save hook
-        accelerator.register_save_state_pre_hook(save_model_hook)
+        if not config.training.get("lora", False):
+            accelerator.register_save_state_pre_hook(save_model_hook)
         
         # Prepare everything with accelerator (do not prepare val_dataloader to enable rank0-only local eval)
         logger.info("Preparing model, optimizer, and dataloaders with Accelerator...")
-        model, optimizer, train_dataloader, scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, scheduler
-        )
+        if config.training.get('lora',False):
+            model,optimizer,train_dataloader,scheduler=prepare_pilot_training(
+                accelerator,model,optimizer,train_dataloader,scheduler)
+        else:
+            model,optimizer,train_dataloader,scheduler=accelerator.prepare(
+                model,optimizer,train_dataloader,scheduler)
         
         # Create trainer
         trainer = UniDiffuserTrainer(

@@ -1,0 +1,14 @@
+{
+  "task_name": "place_can_basket",
+  "task_config": "demo_clean",
+  "task_config_sha256": "3acfcd508078a51e3a48fd7e2f6e61c1b9a6ced0cc44dedd149b55114248e2ab",
+  "suite_role": "validation",
+  "seed_provenance": "Predeclared diagnostic seeds; clean demonstration and pretrained scene overlap unknown",
+  "cases": [
+    {
+      "seed": 100000,
+      "policy_seed": 700000,
+      "instruction": "use one arm to pick up the can, put it into the basket, and use another arm to lift the basket"
+    }
+  ]
+}

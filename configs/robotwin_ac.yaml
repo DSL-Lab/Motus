@@ -1,0 +1,81 @@
+# One matched pilot recipe; representation/seed/output/resume are CLI overrides.
+common:
+  action_dim: 14
+  state_dim: 14
+  action_representation: dense
+  num_video_frames: 8
+  video_height: 384
+  video_width: 320
+  global_downsample_rate: 3
+  video_action_freq_ratio: 2
+dataset:
+  conditioning: robotwin_scene_prefix_v1
+  type: robotwin
+  dataset_dir: /project/6101778/kding/WAM-RoboTwin/data/demo_clean
+  episode_manifest: /project/6101778/kding/Motus/outputs/repair-cache-20261111/manifest.json
+  data_mode: clean
+  task_mode: single
+  task_name: place_can_basket
+  image_aug: false
+model:
+  load_pretrained_backbones: false
+  wan:
+    config_path: /project/6101778/kding/Motus/.runtime/model-metadata/Wan2.2-TI2V-5B
+    checkpoint_path: /project/6101778/kding/Motus/pretrained_models/Wan2.2-TI2V-5B
+    vae_path: /project/6101778/kding/Motus/pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+    precision: bfloat16
+  vlm:
+    checkpoint_path: /project/6101778/kding/Motus/.runtime/model-metadata/Qwen3-VL-2B-Instruct
+    precision: bfloat16
+    frozen: true
+  action_expert:
+    hidden_size: 1024
+    ffn_dim_multiplier: 4
+    norm_eps: 1.0e-5
+  und_expert:
+    hidden_size: 512
+    ffn_dim_multiplier: 4
+    norm_eps: 1.0e-5
+    vlm:
+      input_dim: 2048
+      projector_type: mlp3x_silu
+  inference:
+    num_inference_timesteps: 10
+  loss_weights:
+    video_loss_weight: 1.0
+    action_loss_weight: 1.0
+training:
+  lora: true
+  lora_rank: 16
+  lora_alpha: 32
+  seed: 0
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  max_steps: 1000
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  scheduler_type: warmup_cosine
+  warmup_steps: 50
+  grad_clip_norm: 1.0
+  use_amp: true
+system:
+  checkpoint_dir: /project/6101778/kding/Motus/outputs
+  log_level: INFO
+  log_interval: 1
+  save_interval: 100
+  val_interval: 1000
+  num_workers: 0
+  pin_memory: true
+logging:
+  report_to: none
+  wandb_project: motus-ac
+  tensorboard_log_dir: tensorboard_logs
+  run_name: null
+resume:
+  checkpoint_path: null
+  reset_scheduler: false
+execution:
+  control_dt_s: null  # Must come from verified source timestamps, never inferred Hz.
+  clock_provenance: null
+finetune:
+  checkpoint_path: /project/6101778/kding/Motus/pretrained_models/Motus_robotwin2

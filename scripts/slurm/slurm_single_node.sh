@@ -1,86 +1,37 @@
-#!/bin/bash
-# SLURM script for single node 8-GPU training
-# Usage: sbatch scripts/slurm_single_node.sh
-
-#SBATCH --job-name=motus
-#SBATCH --output=/path/to/Motus/logs/slurm_single_%j.out
-#SBATCH --error=/path/to/Motus/logs_/slurm_single_%j.err
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=256
-#SBATCH --mem=1500G
-#SBATCH --partition=xxx  # change here
-#SBATCH --exclusive
-
-echo "Starting single node job on $(hostname) at $(date)"
-echo "SLURM_JOB_ID: $SLURM_JOB_ID"
-echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
-echo "SLURM_GPUS_ON_NODE: $SLURM_GPUS_ON_NODE"
-
-# Setup environment
-PROJECT_ROOT="/path/to/Motus"
-cd $PROJECT_ROOT
-
-# Load modules and activate conda environment
-module load cuda/12.8 || echo "Warning: Could not load CUDA module"
-source /path/to/miniconda3/etc/profile.d/conda.sh
-conda activate /path/to/motus_env
-
-# Set environment variables
-export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH}
-export OMP_NUM_THREADS=8
-export CUDA_HOME=$CONDA_PREFIX
-
-# Get master node address (single node -> localhost is fine)
-if [ -z "$SLURM_JOB_ID" ]; then
-    master_addr=127.0.0.1
-else
-    nodes=$(scontrol show hostnames $SLURM_JOB_NODELIST)
-    master_addr=$(echo "$nodes" | head -n 1)
-fi
-
-# NCCL settings for better performance
-export NCCL_IB_HCA=mlx5_0:1,mlx5_1:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_13:1,mlx5_16:1,mlx5_17:1
-export NCCL_IB_DISABLE=0
-export NCCL_SOCKET_IFNAME=bond1
-export NCCL_IB_RETRY_CNT=7
-export NCCL_IB_TIMEOUT=23
-export NCCL_DEBUG=INFO
-
-# Increase timeout for checkpoint saving (default is 600s/10min, set to 30min)
-export NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800
-
-# Create logs directory (for any additional logs)
-mkdir -p /path/to/Motus/logs
-
-CONFIG_FILE=${CONFIG_FILE:-"configs/robotwin.yaml"}
-RUN_NAME=${RUN_NAME:-"robotwin_test"}
-MASTER_PORT=${MASTER_PORT:-29500}
-
-echo "Worker configuration:"
-echo "  Node: $(hostname)"
-echo "  Node rank: $SLURM_NODEID"
-echo "  Master addr: $master_addr"
-echo "  Master port: $MASTER_PORT"
-echo "  Config: $CONFIG_FILE"
-echo "  Run name: $RUN_NAME"
-echo "  Resume From (YAML): resume.checkpoint_path"
-echo "  Finetune From (YAML): finetune.checkpoint_path"
-
-# Single node training with torchrun + DeepSpeed
-torchrun \
-    --nnodes=$SLURM_JOB_NUM_NODES \
-    --nproc_per_node=$SLURM_GPUS_ON_NODE \
-    --node_rank=$SLURM_NODEID \
-    --master_addr=$master_addr \
-    --master_port=$MASTER_PORT \
-    train/train.py \
-    --deepspeed configs/zero1.json \
-    --config $CONFIG_FILE \
-    $(if [ -n "$RUN_NAME" ]; then echo "--run_name $RUN_NAME"; fi) \
-    --report_to tensorboard \
-
-echo "Training completed at $(date)"
+#!/usr/bin/env bash
+#SBATCH --job-name=motus-ac
+#SBATCH --account=aip-rjliao
+#SBATCH --gres=gpu:l40s:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=64G
+#SBATCH --time=00:15:00
+#SBATCH --output=logs/ac-%j.log
+set -euo pipefail
+# Submit from Motus; one shared allocated entry point for checks and A/C.
+cd "${SLURM_SUBMIT_DIR:?Submit with sbatch from Motus}"
+[[ -f models/motus.py ]] || { echo 'Submit from Motus' >&2; exit 1; }
+run_dir="outputs/jobs/$SLURM_JOB_ID"
+mkdir -p "$run_dir"
+git rev-parse HEAD > "$run_dir/source_commit.txt"
+git diff --binary > "$run_dir/source.patch"
+git ls-files -co --exclude-standard -z | tar --null -T - -czf "$run_dir/source.tar.gz"
+for reference in ../bspline-policy ../WAM-RoboTwin ../WAM-RoboTwin/XPolicyLab; do
+    printf '%s ' "$reference" >> "$run_dir/reference_commits.txt"
+    git -C "$reference" rev-parse HEAD >> "$run_dir/reference_commits.txt"
+done
+scontrol show job "$SLURM_JOB_ID" > "$run_dir/allocation.txt"
+printf '%q ' "$@" > "$run_dir/command.txt"
+printf '\n' >> "$run_dir/command.txt"
+# Hash immutable large assets once inside an allocation, never on login nodes.
+(
+    flock 8
+    if [[ ! -s outputs/asset_sha256.txt ]]; then
+        sha256sum ../containers/robotwin-cu121.sif \
+            pretrained_models/Motus_robotwin2/mp_rank_00_model_states.pt \
+            pretrained_models/Wan2.2-TI2V-5B/Wan2.2_VAE.pth \
+            pretrained_models/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth \
+            > "outputs/asset_sha256.$SLURM_JOB_ID.tmp"
+        mv "outputs/asset_sha256.$SLURM_JOB_ID.tmp" outputs/asset_sha256.txt
+    fi
+) 8>outputs/asset_sha256.lock
+bash "${1:-scripts/experiments/smoke_test.sh}" "${@:2}"

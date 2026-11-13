@@ -114,7 +114,16 @@ def create_scheduler(optimizer, config):
     """
     scheduler_type = getattr(config.training, 'scheduler_type', 'cosine')
     
-    if scheduler_type == "linear":
+    if scheduler_type == "warmup_cosine":
+        warmup = int(config.training.warmup_steps)
+        total = int(config.training.max_steps)
+        def multiplier(step):
+            if step < warmup:
+                return (step + 1) / max(1, warmup)
+            progress = min(1.0, (step - warmup) / max(1, total - warmup))
+            return 0.1 + 0.9 * (1 + math.cos(math.pi * progress)) / 2
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
+    elif scheduler_type == "linear":
         return LambdaLinearScheduler(
             optimizer,
             warm_up_steps=config.training.warmup_steps,

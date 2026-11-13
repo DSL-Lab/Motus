@@ -61,6 +61,9 @@ class MotusConfig:
     action_expert_ffn_dim_multiplier: int = 4  # FFN dimension multiplier
     action_expert_norm_eps: float = 1e-6    # Layer norm epsilon for Action Expert
 
+    # Explicit experiment representation; dense is the original path.
+    action_representation: str = "dense"
+
     # Sampling settings
     global_downsample_rate: int = 3     # Global downsampling rate
     video_action_freq_ratio: int = 4    # Video:Action frequency ratio
@@ -87,7 +90,15 @@ class MotusConfig:
     def __post_init__(self):
         """Calculate derived parameters."""
         # Action chunk size is determined by global downsample rate and frequency ratio
+        if self.action_representation not in ("dense", "spline"):
+            raise ValueError("action_representation must be dense or spline")
         self.action_chunk_size = self.num_video_frames * self.video_action_freq_ratio
+        self.action_token_dim = self.action_dim
+        if self.action_representation == "spline":
+            if self.num_video_frames != 8:
+                raise ValueError("verified spline target budget requires 8 future frames")
+            self.action_chunk_size = 36
+            self.action_token_dim = self.action_dim + 1
         
         # Default understanding layers to extract from (if not specified)
         if self.und_layers_to_extract is None:
@@ -585,7 +596,7 @@ class Motus(nn.Module):
             ffn_dim=config.action_expert_dim * config.action_expert_ffn_dim_multiplier,
             num_layers=config.num_layers,
             state_dim=config.action_state_dim,
-            action_dim=config.action_dim,
+            action_dim=config.action_token_dim,
             chunk_size=action_chunk_size_for_expert,
             num_registers=num_registers,
             video_feature_dim=wan_dim,
@@ -900,7 +911,15 @@ class Motus(nn.Module):
         )
         
         if return_dict:
+            components = {}
+            if self.config.action_representation == 'spline':
+                components = {
+                    'action_knot_loss': (action_pred[:,:,0]-action_target[:,:,0]).square().mean(),
+                    'action_control_loss': (action_pred[:,:,1:]-action_target[:,:,1:]).square().mean(),
+                    'action_padding_control_loss': (action_pred[:,32:,1:]-action_target[:,32:,1:]).square().mean(),
+                }
             return {
+                **components,
                 'total_loss': total_loss,
                 'video_loss': video_loss,
                 'action_loss': action_loss,
@@ -947,7 +966,7 @@ class Motus(nn.Module):
         num_total_latent_frames = 1 + self.config.num_video_frames // 4
         video_latent = torch.randn((B, C_latent, num_total_latent_frames, H_latent, W_latent), device=self.device, dtype=self.dtype)
         video_latent[:, :, 0:1] = condition_frame_latent
-        action_shape = (B, self.config.action_chunk_size, self.config.action_dim)
+        action_shape = (B, self.config.action_chunk_size, self.config.action_token_dim)
         action_latent = torch.randn(action_shape, device=self.device, dtype=self.dtype)
 
         # 2. Understanding Expert features and T5 context

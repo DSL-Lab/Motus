@@ -50,6 +50,10 @@ def create_dataset(config: OmegaConf, val: bool = False):
         if hasattr(config.dataset, 'randomized_limit_per_task'):
             params['randomized_limit_per_task'] = config.dataset.randomized_limit_per_task
         
+        if config.dataset.get('episode_manifest'):
+            params['episode_manifest'] = config.dataset.episode_manifest
+            params['action_representation'] = config.common.get('action_representation', 'dense')
+
         # Add VLM checkpoint path
         if hasattr(config.model, 'vlm') and hasattr(config.model.vlm, 'checkpoint_path'):
             params['vlm_checkpoint_path'] = config.model.vlm.checkpoint_path

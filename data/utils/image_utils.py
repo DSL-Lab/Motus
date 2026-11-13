@@ -10,7 +10,6 @@ import torch
 from PIL import Image
 from typing import Tuple, List
 import random
-from decord import VideoReader, cpu
 
 
 def resize_with_padding(frame: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
@@ -82,6 +81,7 @@ def load_video_frames(video_path: str, frame_indices: List[int], target_size: Tu
     """
 
     # Open video (CPU decoding)
+    from decord import VideoReader, cpu
     vr = VideoReader(video_path, ctx=cpu(0), num_threads=4)
     total_frames = len(vr)
 
@@ -122,6 +122,7 @@ def load_first_frame(video_path: str, frame_idx: int, target_size: Tuple[int, in
         - resized_frame: Frame tensor [C, H, W] in range [0, 1] with padding applied
         - original_frame: Frame tensor [C, H, W] in range [0, 1] with original resolution
     """
+    from decord import VideoReader, cpu
     vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
     total_frames = len(vr)
     if frame_idx >= total_frames:
@@ -135,6 +136,7 @@ def load_first_frame(video_path: str, frame_idx: int, target_size: Tuple[int, in
 
 def get_video_frame_count(video_path: str) -> int:
     """Get total frame count of a video using decord only."""
+    from decord import VideoReader, cpu
     vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
     return len(vr)
 
