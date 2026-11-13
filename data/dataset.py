@@ -61,6 +61,9 @@ def create_dataset(config: OmegaConf, val: bool = False):
         
         # Set validation flag
         params['val'] = val
+        if config.get('research', {}).get('enabled', False):
+            params['window_manifest'] = config.research.window_manifest
+            params['research_contract'] = OmegaConf.to_container(config.research.contract, resolve=True)
         
         return RobotWinTaskDataset(**params)
     
@@ -335,5 +338,8 @@ def collate_fn(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]
 
     if initial_states is not None:
         result['initial_state'] = initial_states
+    if all('video_latent_valid' in sample for sample in batch):
+        result['video_latent_valid'] = torch.stack([sample['video_latent_valid'] for sample in batch])
+        result['research_metadata'] = [sample['research_metadata'] for sample in batch]
     
     return result

@@ -99,7 +99,6 @@ def inference_sample(model, batch: Dict, config) -> Tuple[torch.Tensor, torch.Te
     # Move batch data to device
     device = next(model.parameters()).device
     first_frame = batch['first_frame'].to(device)  # [B, C, H, W] - conditioning frame
-    video_frames = batch['video_frames'].to(device)  # [B, num_video_frames, C, H, W] - target frames
     
     state = batch['initial_state'].to(device) if 'initial_state' in batch and batch['initial_state'] is not None else None
     

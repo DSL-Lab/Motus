@@ -70,6 +70,8 @@ class RobotWinTaskDataset(data.Dataset):
         
         # VLM processing parameters
         vlm_checkpoint_path: Optional[str] = None,  # Path to VLM model
+        window_manifest: Optional[str] = None,
+        research_contract: Optional[dict] = None,
     ):
         """
         Initialize RobotWin dataset with flexible sampling.
@@ -95,6 +97,8 @@ class RobotWinTaskDataset(data.Dataset):
         self.task_mode = task_mode
         self.task_name = task_name
         self.randomized_limit_per_task = randomized_limit_per_task
+        self.window_manifest = window_manifest
+        self.research_contract = research_contract
         
         # Sampling parameters
         self.global_downsample_rate = global_downsample_rate
@@ -217,6 +221,11 @@ class RobotWinTaskDataset(data.Dataset):
     
     def _load_episodes(self) -> List[Dict[str, Any]]:
         """Initialize dataset by scanning folders."""
+        if self.window_manifest:
+            from .research_windows import load_windows
+            self.research_windows = load_windows(self.window_manifest, self.val, self.research_contract)
+            self.total_episodes = len({w['qpos_path'] for w in self.research_windows})
+            return self.research_windows
         logger.info("Initializing dataset...")
         
         # Determine which data splits to scan
@@ -335,13 +344,13 @@ class RobotWinTaskDataset(data.Dataset):
         
         return initial_state, action_sequence
     
-    def _load_language_embedding(self, lang_path: str) -> tuple[torch.Tensor, int]:
+    def _load_language_embedding(self, lang_path: str, selected_idx=None) -> tuple[torch.Tensor, int]:
         """Load pre-encoded language embedding and return the selected index."""
         try:
             embedding_data = torch.load(lang_path, map_location='cpu')
             
             # RobotWin embedding is always a list of tensors
-            selected_idx = random.randint(0, len(embedding_data) - 1)
+            selected_idx = random.randint(0, len(embedding_data) - 1) if selected_idx is None else selected_idx
             embeddings = embedding_data[selected_idx]  # [seq_len, 4096]
             
             # Remove batch dimension if present
@@ -452,7 +461,7 @@ class RobotWinTaskDataset(data.Dataset):
     
     def __len__(self) -> int:
         """Return approximate dataset length."""
-        return self.total_episodes * 10  # Assume 100 samples per episode
+        return len(self.research_windows) if self.window_manifest else self.total_episodes * 10
     
     def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
         """
@@ -464,6 +473,8 @@ class RobotWinTaskDataset(data.Dataset):
         Returns:
             Dictionary containing training data
         """
+        if self.window_manifest:
+            return self._research_sample(idx)
         # Robust sampling with retries to avoid returning None (which breaks DDP sync)
         max_attempts = 8
         for _ in range(max_attempts):
@@ -543,3 +554,26 @@ class RobotWinTaskDataset(data.Dataset):
 
         # If all attempts failed, let caller drop this sample (rare)
         return None
+
+    def _research_sample(self, idx):
+        """Reuse original frame/language/VLM processing on explicit A/C windows."""
+        from .research_windows import window_targets
+        window = self.research_windows[idx]
+        target = window_targets(window, self.research_contract['representation'])
+        source = torch.load(window['qpos_path'], map_location='cpu', weights_only=True).float().numpy()
+        if not np.array_equal(source.astype(np.float64), window['_actions']):
+            raise ValueError('MOTUS PT data differs from source-bound spline cache')
+        if get_video_frame_count(window['video_path']) != len(window['_timeline']['camera_times']):
+            raise ValueError('Video frame count differs from verified camera clock')
+        first = load_video_frames(window['video_path'], [target['observation_camera_index']], self.video_size).squeeze(0)
+        future = load_video_frames(window['video_path'], target['video_indices'], self.video_size)
+        language, instruction_idx = self._load_language_embedding(window['lang_path'], window.get('language_index', 0))
+        instruction = self._load_text_instruction(window['task_name'], window['episode_name'], instruction_idx, split=window['data_mode'])
+        if self.vlm_processor is None:
+            raise ValueError('Research conditioning requires the original VLM processor')
+        vlm_inputs = preprocess_vlm_messages(instruction, tensor_to_pil(first), self.vlm_processor)
+        return dict(first_frame=first, video_frames=future, initial_state=torch.from_numpy(target['initial_state']),
+                    action_sequence=torch.from_numpy(target['actions'].copy()), language_embedding=language,
+                    vlm_inputs=vlm_inputs, video_latent_valid=torch.tensor(target['latent_valid'], dtype=torch.bool),
+                    research_metadata=dict(window_identity=target['identity'], observation_index=window['observation_index'],
+                                           cache_path=window['cache_path'], dense_indices=window['_dense_indices'].tolist()))

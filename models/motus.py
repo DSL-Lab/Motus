@@ -57,6 +57,9 @@ class MotusConfig:
     num_layers: int = 30 
     action_state_dim: int = 14
     action_dim: int = 14
+    action_representation: str = "dense"
+    action_parameter_rows: int = 36
+    action_precision: str = "model"
     action_expert_dim: int = 1024           # Configurable hidden dimension
     action_expert_ffn_dim_multiplier: int = 4  # FFN dimension multiplier
     action_expert_norm_eps: float = 1e-6    # Layer norm epsilon for Action Expert
@@ -88,6 +91,12 @@ class MotusConfig:
         """Calculate derived parameters."""
         # Action chunk size is determined by global downsample rate and frequency ratio
         self.action_chunk_size = self.num_video_frames * self.video_action_freq_ratio
+        if self.action_representation == "spline":
+            if self.action_dim != 15 or self.action_state_dim != 14 or self.action_parameter_rows != 36:
+                raise ValueError("Verified cubic contract requires 36x15 targets and 14D proprioception")
+            self.action_chunk_size = self.action_parameter_rows
+        elif self.action_representation != "dense":
+            raise ValueError("Unknown action representation")
         
         # Default understanding layers to extract from (if not specified)
         if self.und_layers_to_extract is None:
@@ -109,6 +118,9 @@ class VideoModule(nn.Module):
         """Prepare video tokens from pre-processed noisy latent."""
         # Through patch_embedding: 48 -> 3072 channels
         video_patched = self.video_model.wan_model.patch_embedding(noisy_video_latent)
+        # RoPE/unpatchify use the actual VAE+patch grid, including eval batches.
+        self.grid_sizes = torch.tensor(video_patched.shape[2:], dtype=torch.long,
+                                       device=video_patched.device).unsqueeze(0).expand(video_patched.shape[0], -1)
 
         # Flatten and convert to tokens
         video_features = video_patched.flatten(2).transpose(1, 2)
@@ -219,6 +231,7 @@ class VideoModule(nn.Module):
         action_block: nn.Module,
         und_tokens: torch.Tensor,
         und_block: nn.Module,
+        video_latent_valid: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Trimodal joint self-attention: WAN + Action + Understanding via WAN self-attn (MoT)."""
         wan_layer = self.video_model.wan_model.blocks[layer_idx]
@@ -262,10 +275,17 @@ class VideoModule(nn.Module):
             freqs = freqs.to(self.device)
 
         # Call WAN self-attn with trimodal MoT
+        joint_key_valid = None
+        if video_latent_valid is not None:
+            latent_count = video_latent_valid.shape[1]
+            if L_v % latent_count or int(self.grid_sizes[0, 0]) != latent_count:
+                raise ValueError("Video token grid is incompatible with latent validity")
+            video_keys = video_latent_valid.repeat_interleave(L_v // latent_count, dim=1)
+            joint_key_valid = torch.cat([video_keys, torch.ones(B, L_a + L_u, device=video_keys.device, dtype=torch.bool)], dim=1)
         y, action_out_h, und_out_h = wan_layer.self_attn(
-            norm_video, seq_lens, self.grid_sizes, freqs,
+            norm_video, seq_lens, self.grid_sizes[:1].expand(B, -1), freqs,
             action_q=a_q, action_k=a_k, action_v=a_v,
-            und_q=u_q, und_k=u_k, und_v=u_v
+            und_q=u_q, und_k=u_k, und_v=u_v, joint_key_valid=joint_key_valid,
         )
         
         # Project Understanding Expert output
@@ -494,6 +514,7 @@ class Motus(nn.Module):
 
         # Set unified data type for the model
         self.dtype = torch.bfloat16
+        self.action_dtype = torch.float32 if config.action_precision == 'float32' else self.dtype
 
         # Initialize video/VLM backbones
         load_backbones = True if config.load_pretrained_backbones is None else bool(config.load_pretrained_backbones)
@@ -765,6 +786,9 @@ class Motus(nn.Module):
         missing, unexpected = self.load_state_dict(filtered, strict=False)
         logger.info(f"Loaded pretrain weights (filtered). Missing: {len(missing)}, Unexpected: {len(unexpected)}")
 
+    def forward(self, **kwargs):
+        return self.training_step(**kwargs)
+
     def training_step(
         self,
         first_frame: torch.Tensor,         # [B, C, H, W] - first frame
@@ -773,7 +797,8 @@ class Motus(nn.Module):
         actions: torch.Tensor = None,     # [B, chunk_size, action_dim] - actions
         language_embeddings: Optional[List[torch.Tensor]] = None,  # Pre-encoded T5 embeddings for WAN
         vlm_inputs: Optional[List] = None,  # Complete VLM inputs from dataset
-        return_dict: bool = True
+        return_dict: bool = True,
+        video_latent_valid: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         UniDiffuser training step with three modalities.
@@ -792,6 +817,8 @@ class Motus(nn.Module):
             Dictionary containing losses and metrics
         """
         B = video_frames.shape[0]
+        if actions.shape[1:] != (self.config.action_chunk_size, self.config.action_dim):
+            raise ValueError("Action targets disagree with configured representation")
 
         # 1. Video pipeline
         # Normalize/format
@@ -803,6 +830,10 @@ class Motus(nn.Module):
         with torch.no_grad():
             clean_full_latent = self.video_model.encode_video(full_video.to(self.dtype))  # [B, 48, latent_frames, H', W']
             condition_frame_latent = self.video_model.encode_video(first_frame_norm.to(self.dtype))  # [B, 48, 1, H', W']
+        if video_latent_valid is not None:
+            video_latent_valid = video_latent_valid.to(self.device, dtype=torch.bool)
+            if video_latent_valid.shape != (B, clean_full_latent.shape[2]):
+                raise ValueError("VAE output/latent mask length mismatch")
 
         # Flow-Matching noise mixture
         timestep_id = torch.randint(0, self.fm_train_scheduler.num_train_timesteps, (B,))
@@ -824,10 +855,10 @@ class Motus(nn.Module):
         # 2. Action pipeline 
         timestep_id_action = torch.randint(0, self.fm_train_scheduler_action.num_train_timesteps, (B,))
         # Discrete timesteps for time embedding (0..num_train_timesteps)
-        action_t_embed = self.fm_train_scheduler_action.timesteps[timestep_id_action].to(dtype=self.dtype, device=self.device)  # [B]
+        action_t_embed = self.fm_train_scheduler_action.timesteps[timestep_id_action].to(dtype=self.action_dtype, device=self.device)
         # Sigma for action noise mixture
-        sigma_action = self.fm_train_scheduler_action.sigmas[timestep_id_action].to(dtype=self.dtype, device=self.device).view(B, 1, 1)
-        action_noise = torch.randn_like(actions, dtype=self.dtype)
+        sigma_action = self.fm_train_scheduler_action.sigmas[timestep_id_action].to(dtype=self.action_dtype, device=self.device).view(B, 1, 1)
+        action_noise = torch.randn_like(actions, dtype=self.action_dtype)
         noisy_actions = actions * (1 - sigma_action) + action_noise * sigma_action
         action_target = action_noise - actions
 
@@ -864,7 +895,7 @@ class Motus(nn.Module):
                 video_tokens, action_tokens, und_tokens = self.video_module.process_joint_attention(
                     video_tokens, action_tokens, video_adaln_modulation, action_adaln_modulation, layer_idx, 
                     self.action_expert.blocks[layer_idx],
-                    und_tokens, self.und_expert.blocks[layer_idx]
+                    und_tokens, self.und_expert.blocks[layer_idx], video_latent_valid=video_latent_valid,
                 )
 
                 # WAN cross
@@ -890,6 +921,9 @@ class Motus(nn.Module):
             video_pred_masked = video_pred.clone()
             video_pred_masked[:, :, 0:1] = 0
             video_loss = torch.nn.functional.mse_loss(video_pred_masked, video_target, reduction='mean')
+            if video_latent_valid is not None and self.config.action_representation == 'spline':
+                from utils.research import masked_video_loss
+                video_loss = masked_video_loss(video_pred, video_target, video_latent_valid)
         
             # Action loss
             action_loss = torch.nn.functional.mse_loss(action_pred, action_target, reduction='mean')
@@ -948,7 +982,7 @@ class Motus(nn.Module):
         video_latent = torch.randn((B, C_latent, num_total_latent_frames, H_latent, W_latent), device=self.device, dtype=self.dtype)
         video_latent[:, :, 0:1] = condition_frame_latent
         action_shape = (B, self.config.action_chunk_size, self.config.action_dim)
-        action_latent = torch.randn(action_shape, device=self.device, dtype=self.dtype)
+        action_latent = torch.randn(action_shape, device=self.device, dtype=self.action_dtype)
 
         # 2. Understanding Expert features and T5 context
         # Extract understanding features from VLM
@@ -958,14 +992,14 @@ class Motus(nn.Module):
         processed_t5_context = self.video_module.preprocess_t5_embeddings(language_embeddings)
 
         # 3. Denoising loop: from noise (t=1) to clean (t=0)
-        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.dtype)
+        timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=self.action_dtype)
         for i in range(num_inference_steps):
             # Timesteps
             t = timesteps[i]
             t_next = timesteps[i + 1]
             dt = t_next - t
             video_t_scaled = (t * 1000).expand(B).to(self.dtype)
-            action_t_scaled = (t * 1000).expand(B).to(self.dtype)
+            action_t_scaled = (t * 1000).expand(B).to(self.action_dtype)
 
             # Tokens with Registers
             video_tokens = self.video_module.prepare_input(video_latent.to(self.dtype))
@@ -1142,7 +1176,7 @@ class Motus(nn.Module):
             for step_idx, t in enumerate(timesteps):
                 # Prepare model inputs (add batch dimension back)
                 video_latent_input = video_latent.unsqueeze(0).to(self.dtype)  # [1, 48, T, H, W]
-                action_latent_input = action_latent.to(self.dtype)  # [1, chunk_size, action_dim]
+                action_latent_input = action_latent.to(self.action_dtype)
                 
                 # Prepare tokens
                 video_tokens = self.video_module.prepare_input(video_latent_input)
@@ -1268,7 +1302,7 @@ class Motus(nn.Module):
         video_latent = torch.randn((B, C_latent, num_total_latent_frames, H_latent, W_latent), device=self.device, dtype=self.dtype)
         video_latent[:, :, 0:1] = condition_frame_latent
         action_shape = (B, self.config.action_chunk_size, self.config.action_dim)
-        action_latent = torch.randn(action_shape, device=self.device, dtype=self.dtype)
+        action_latent = torch.randn(action_shape, device=self.device, dtype=self.action_dtype)
 
         # 2. Understanding Expert features and T5 context
         # Extract understanding features from VLM

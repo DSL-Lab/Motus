@@ -1,0 +1,4 @@
+# Same windows, conditioning, adapters, loss weights and optimizer as dense A.
+base_config: robotwin_research_A.yaml
+research:
+  representation: spline

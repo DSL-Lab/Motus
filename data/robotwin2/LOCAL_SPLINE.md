@@ -1,5 +1,8 @@
 # Stage 2: local targets, decoder, video inspection and replay
 
+Stage 3's training implementation and still-pending GPU evidence are recorded
+in [RESEARCH_TRAINING.md](../../RESEARCH_TRAINING.md).
+
 No model, training loop, deployment policy wrapper, simulator source or reference
 repository was modified. The adaptive episode fitting algorithm is unchanged.
 All stage-1 files/results and the pre-existing WAM-RoboTwin submodule change

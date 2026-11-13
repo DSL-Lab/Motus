@@ -173,7 +173,8 @@ class WanSelfAttention(nn.Module):
                 action_v: torch.Tensor = None,
                 und_q: torch.Tensor = None,
                 und_k: torch.Tensor = None,
-                und_v: torch.Tensor = None):
+                und_v: torch.Tensor = None,
+                joint_key_valid: torch.Tensor = None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -230,12 +231,19 @@ class WanSelfAttention(nn.Module):
             k_cat = torch.cat(k_parts, dim=1)
             v_cat = torch.cat(v_parts, dim=1)
 
-            attn_out = flash_attention(
-                q=q_cat,
-                k=k_cat,
-                v=v_cat,
-                k_lens=seq_lens,
-                window_size=self.window_size)
+            if joint_key_valid is not None and not bool(joint_key_valid.all()):
+                if joint_key_valid.shape != q_cat.shape[:2] or not joint_key_valid.any(dim=1).all():
+                    raise ValueError("Invalid MoT attention-key validity")
+                # Keep padded queries, exclude invalid video keys for EVERY
+                # branch. Causal VAE prefix masks are prepared by shared code.
+                dtype = v_cat.dtype
+                attn_out = torch.nn.functional.scaled_dot_product_attention(
+                    q_cat.to(dtype).transpose(1, 2), k_cat.to(dtype).transpose(1, 2), v_cat.transpose(1, 2),
+                    attn_mask=joint_key_valid[:, None, None, :], dropout_p=0.).transpose(1, 2)
+            else:
+                attn_out = flash_attention(
+                    q=q_cat, k=k_cat, v=v_cat, k_lens=seq_lens,
+                    window_size=self.window_size)
 
             # Split outputs back to respective modalities
             x_out = attn_out[:, :L_x, :, :]

@@ -155,7 +155,7 @@ class StateActionEncoder(nn.Module):
         state_encoded = self.state_encoder(state_tokens)  # [B, 1, dim]
         
         # Encode action tokens: direct encoding
-        action_encoded = self.action_encoder(action_tokens)  # [B, action_chunk_size, dim]
+        action_encoded = self.action_encoder(action_tokens.to(next(self.action_encoder.parameters()).dtype)).to(state_encoded.dtype)
         
         # Concatenate state and action encodings
         encoded = torch.cat([state_encoded, action_encoded], dim=1)  # [B, chunk_size, dim]
@@ -303,7 +303,7 @@ class ActionDecoder(nn.Module):
         with amp_autocast(x.device, dtype=torch.float32):
             e0, e1 = (self.modulation.unsqueeze(0) + time_emb.unsqueeze(2)).chunk(2, dim=2)
         z = self.norm(x) * (1 + e1.squeeze(2)) + e0.squeeze(2)
-        return self.action_head(z)
+        return self.action_head(z.to(next(self.action_head.parameters()).dtype)).to(z.dtype)
 
 class ActionExpert(nn.Module):
     """

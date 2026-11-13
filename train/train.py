@@ -23,7 +23,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 from accelerate import Accelerator
-from accelerate.utils import DeepSpeedPlugin, ProjectConfiguration
+from accelerate.utils import DeepSpeedPlugin, ProjectConfiguration, GradientAccumulationPlugin, set_seed
 import yaml
 from omegaconf import OmegaConf
 from datetime import datetime
@@ -61,9 +61,17 @@ def load_config(config_path: str) -> OmegaConf:
         raise FileNotFoundError(f"Config file not found: {config_path}")
     
     config = OmegaConf.load(config_path)
+    if config.get('base_config'):
+        parent = load_config(str(Path(config_path).parent / config.pop('base_config')))
+        config = OmegaConf.merge(parent, config)
     
     # Calculate derived parameters
     config.common.action_chunk_size = config.common.num_video_frames * config.common.video_action_freq_ratio
+    if config.get('research', {}).get('enabled', False):
+        if (config.common.num_video_frames, config.common.video_action_freq_ratio, config.common.global_downsample_rate) != (8, 2, 3):
+            raise ValueError('Matched research audits exactly 8 video frames, ratio 2, stride 3')
+        config.common.action_dim = 15 if config.research.representation == 'spline' else 14
+        config.common.action_chunk_size = 36 if config.research.representation == 'spline' else 16
     
     # Validate dataset configuration
     dataset_config = {
@@ -200,6 +208,9 @@ class UniDiffuserTrainer:
         else:
             logger.warning(f"Could not extract step number from {checkpoint_path}, starting from step 0")
 
+        if self.config.get('research', {}).get('enabled', False):
+            from utils.research import load_research_bundle
+            load_research_bundle(self.accelerator.unwrap_model(self.model), checkpoint_path)
         # Load using accelerator (includes model, optimizer, scheduler states)
         self.accelerator.load_state(checkpoint_path)
         logger.info(f"Checkpoint loaded successfully from {checkpoint_path}")
@@ -268,9 +279,14 @@ class UniDiffuserTrainer:
             logger.info(f"Current learning rate after checkpoint load (optimizer): {current_lr:.2e}")
     
     def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
+        if self.accelerator is not None:
+            with self.accelerator.accumulate(self.model):
+                return self._train_microbatch(batch)
+        return self._train_microbatch(batch)
+
+    def _train_microbatch(self, batch: Dict[str, Any]) -> Dict[str, float]:
         """Single training step for UniDiffuser."""
         self.model.train()
-        self.optimizer.zero_grad()
         
         first_frame = batch['first_frame'].to(self.device, dtype=self.dtype)          # [B, C, H, W]
         video_frames = batch['video_frames'].to(self.device, dtype=self.dtype)        # [B, num_video_frames, C, H, W]
@@ -280,7 +296,8 @@ class UniDiffuserTrainer:
         state = batch.get('initial_state', None)
         if state is not None:
             state = state.to(self.device, dtype=self.dtype)      # [B, state_dim]
-        actions = batch['action_sequence'].to(self.device, dtype=self.dtype)  # [B, action_chunk_size, action_dim]
+        action_dtype = torch.float32 if self.config.get('research', {}).get('enabled', False) else self.dtype
+        actions = batch['action_sequence'].to(self.device, dtype=action_dtype)
         # Handle VLM inputs - it's a Dict[str, Tensor] from collate_fn
         vlm_inputs = batch['vlm_inputs']
         if vlm_inputs is not None:
@@ -290,15 +307,15 @@ class UniDiffuserTrainer:
         
         # Forward pass through UniDiffuser
         # Handle DDP wrapper
-        model = self.model.module if hasattr(self.model, 'module') else self.model
-        loss_dict = model.training_step(
+        loss_dict = self.model(
             first_frame=first_frame,
             video_frames=video_frames,
             state=state,
             actions=actions,
             language_embeddings=language_embeddings,  # For WAN cross attention
             vlm_inputs=vlm_inputs,  # Complete VLM inputs from dataset
-            return_dict=True
+            return_dict=True,
+            video_latent_valid=batch.get('video_latent_valid'),
         )
         
         total_loss = loss_dict['total_loss']
@@ -311,16 +328,31 @@ class UniDiffuserTrainer:
         
         # Gradient clipping
         grad_clip_norm = self.config.training.grad_clip_norm if hasattr(self.config.training, 'grad_clip_norm') else 1.0
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
+        synchronized = self.accelerator is None or self.accelerator.sync_gradients
+        if synchronized:
+            if self.accelerator is not None:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), grad_clip_norm)
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip_norm)
+            if self.config.get('research', {}).get('enabled', False) and self.global_step < 3:
+                from utils.research import gradient_summary
+                gradients = gradient_summary(self.accelerator.unwrap_model(self.model))
+                if self.rank == 0:
+                    (self.checkpoint_dir / f'gradients_step_{self.global_step}.json').write_text(json.dumps(gradients, indent=2))
+                missing = [name for name, value in gradients.items() if value is None]
+                if self.global_step == 2 and missing:
+                    raise RuntimeError(f'No gradient path to actual MOTUS losses: {missing}')
         
         # Optimizer step
         self.optimizer.step()
         
-        if self.scheduler:
+        if self.scheduler and synchronized:
             self.scheduler.step()
+        self.optimizer.zero_grad()
         
         # Convert to float for logging
         metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in loss_dict.items()}
+        metrics['_optimizer_step'] = synchronized
         
         return metrics
     
@@ -353,6 +385,7 @@ class UniDiffuserTrainer:
         # Step-based training loop
         data_iter = iter(self.train_dataloader)
         epoch = 0
+        self.optimizer.zero_grad()
         
         while self.global_step < max_steps:
             try:
@@ -372,6 +405,8 @@ class UniDiffuserTrainer:
 
             # Training step
             metrics = self.train_step(batch)
+            if not metrics.pop('_optimizer_step', True):
+                continue
             
             step_time = time.time() - step_start_time
             self.global_step += 1
@@ -412,7 +447,7 @@ class UniDiffuserTrainer:
                     self.tb_writer.add_scalar('train/epoch', epoch, self.global_step)
 
             # Validation: rank0-only local eval; then synchronize all processes
-            if self.global_step % val_interval == 0 and self.val_dataloader is not None:
+            if self.global_step % val_interval == 0 and self.val_dataloader is not None and not self.config.get('research', {}).get('enabled', False):
                 if self.rank == 0:
                     val_metrics = evaluate_model(
                         self.model, self.val_dataloader, self.accelerator, self.config,
@@ -448,6 +483,8 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple:
         video_precision=config.model.wan.precision,
         action_state_dim=config.common.state_dim,
         action_dim=config.common.action_dim,
+        action_representation=config.get('research', {}).get('representation', 'dense'),
+        action_precision='float32' if config.get('research', {}).get('enabled', False) else 'model',
         # Action Expert configuration from config file
         action_expert_dim=config.model.action_expert.hidden_size,
         action_expert_ffn_dim_multiplier=config.model.action_expert.ffn_dim_multiplier,
@@ -473,6 +510,12 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple:
     
     # Create model (Accelerator will handle device placement and DDP)
     model = Motus(model_config)
+    if config.get('research', {}).get('enabled', False):
+        from utils.research import load_compatible_base, configure_adapters
+        model.research_base = load_compatible_base(model, config.finetune.checkpoint_path)
+        model.research_contract = OmegaConf.to_container(config.research.contract, resolve=True)
+        set_seed(int(config.research.seed))
+        configure_adapters(model, OmegaConf.to_container(config.research.lora, resolve=True), seed=int(config.research.seed))
     
     # Optimizer - parameter groups for separate WAN (video model) learning rate
     base_lr = float(config.training.learning_rate)
@@ -495,6 +538,9 @@ def create_model_and_optimizer(config: OmegaConf) -> tuple:
         weight_decay=config.training.weight_decay,
         betas=(0.9, 0.95)
     )
+    if config.get('research', {}).get('enabled', False):
+        from utils.research import trainable_summary
+        model.research_trainables = trainable_summary(model, optimizer)
     
     # Scheduler
     scheduler = create_scheduler(optimizer, config)
@@ -561,11 +607,35 @@ def main():
     # DeepSpeed settings
     parser.add_argument("--deepspeed", type=str, default=None, help="Path to DeepSpeed config file")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
+    parser.add_argument('--diagnostic-eval-only', type=str, help='Fresh-process generation from a research checkpoint directory')
     
     args = parser.parse_args()
     
     # Load configuration
     config = load_config(args.config)
+    research = config.get('research', {}).get('enabled', False)
+    if args.diagnostic_eval_only and not research:
+        raise ValueError('Diagnostic reload requires a research A/C configuration')
+    if research:
+        from utils.research import load_contract
+        if not os.environ.get('SLURM_JOB_ID') or not os.environ.get('SLURMD_NODENAME') or not torch.cuda.is_available():
+            raise RuntimeError('Research model execution requires allocated Slurm compute; never use a login node')
+        if config.research.phase != 'tiny' or config.training.max_steps > 100:
+            raise RuntimeError('Full pilot blocked pending conversion, replay and multi-seed fresh-reload evidence')
+        if config.training_mode != 'finetune':
+            raise ValueError('Matched A/C require current observation and state conditioning')
+        if args.deepspeed:
+            raise ValueError('Tiny diagnostic uses the existing single-process Accelerator path; DeepSpeed reload is not yet validated')
+        for artifact in [config.model.wan.config_path, config.model.wan.vae_path,
+                         config.model.vlm.checkpoint_path, config.finetune.checkpoint_path]:
+            if not Path(artifact).exists():
+                raise FileNotFoundError(f'Research requires existing local model assets: {artifact}')
+        config.research.contract = load_contract(OmegaConf.to_container(config, resolve=True))
+        from data.robotwin2.research_windows import load_windows
+        contract = OmegaConf.to_container(config.research.contract, resolve=True)
+        load_windows(config.research.window_manifest, False, contract)
+        load_windows(config.research.window_manifest, True, contract)
+        set_seed(int(config.research.seed))
     if args.checkpoint_dir is not None:
         config.system.checkpoint_dir = args.checkpoint_dir
     if args.report_to is not None:
@@ -600,7 +670,8 @@ def main():
         deepspeed_plugin=DeepSpeedPlugin(
             hf_ds_config=args.deepspeed
         ) if args.deepspeed is not None else None,
-        gradient_accumulation_steps=config.training.get('gradient_accumulation_steps', 1),
+        gradient_accumulation_plugin=GradientAccumulationPlugin(
+            num_steps=config.training.get('gradient_accumulation_steps', 1), sync_with_dataloader=False),
         mixed_precision="bf16",
         log_with=config.logging.get('report_to', 'tensorboard'),
         project_dir=config.system.checkpoint_dir,
@@ -628,6 +699,8 @@ def main():
     
     # Update checkpoint directory to include run name
     config.system.checkpoint_dir = os.path.join(config.system.checkpoint_dir, run_name)
+    if research and Path(config.system.checkpoint_dir).exists() and not config.resume.checkpoint_path:
+        raise FileExistsError('Research output exists; use a fresh --checkpoint_dir to preserve previous diagnostics')
     logger.info(f"Dataset: {dataset_name}")
     logger.info(f"Checkpoints will be saved to: {config.system.checkpoint_dir}")
     
@@ -655,7 +728,7 @@ def main():
 
         # Optional: load finetune weights for partial init
         finetune_ckpt = getattr(config.finetune, 'checkpoint_path', None) if hasattr(config, 'finetune') else None
-        if getattr(config, 'training_mode', 'finetune') == 'finetune' and finetune_ckpt:
+        if not research and getattr(config, 'training_mode', 'finetune') == 'finetune' and finetune_ckpt:
             logger.info(f"Loading finetune weights from {finetune_ckpt} (partial)...")
             try:
                 (model.module if hasattr(model, 'module') else model).load_pretrain_weights(finetune_ckpt)
@@ -666,10 +739,22 @@ def main():
         # Create dataloaders
         logger.info("Creating dataloaders...")
         train_dataloader, val_dataloader = create_dataloaders(config, rank, world_size)
+        if research and rank == 0:
+            Path(config.system.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+            (Path(config.system.checkpoint_dir) / 'trainables.json').write_text(json.dumps(model.research_trainables, indent=2))
+        if research and world_size != 1:
+            raise ValueError('Tiny diagnostic is limited to one allocated GPU process before distributed validation')
         
         # Create custom saving hook to avoid NCCL timeout issues
         def save_model_hook(models, weights, output_dir):
             """Custom save hook to save model safely and avoid NCCL timeouts."""
+            if research:
+                from utils.research import save_research_bundle
+                if accelerator.is_main_process:
+                    save_research_bundle(accelerator.unwrap_model(models[0]), output_dir,
+                                         OmegaConf.to_container(config, resolve=True))
+                weights.clear()
+                return
             if accelerator.is_main_process:
                 logger.info(f"Saving model to {output_dir}")
                 for i, model_to_save in enumerate(models):
@@ -680,15 +765,26 @@ def main():
                     model_save_path = os.path.join(output_dir, f"pytorch_model_{i}.bin")
                     torch.save(unwrapped_model.state_dict(), model_save_path)
                     logger.info(f"Model {i} saved to {model_save_path}")
+
+        def load_model_hook(models, input_dir):
+            if research:
+                from utils.research import load_research_bundle
+                for model_to_load in list(models):
+                    load_research_bundle(accelerator.unwrap_model(model_to_load), input_dir)
+                models.clear()
         
         # Register the custom save hook
         accelerator.register_save_state_pre_hook(save_model_hook)
+        if research:
+            accelerator.register_load_state_pre_hook(load_model_hook)
         
         # Prepare everything with accelerator (do not prepare val_dataloader to enable rank0-only local eval)
         logger.info("Preparing model, optimizer, and dataloaders with Accelerator...")
         model, optimizer, train_dataloader, scheduler = accelerator.prepare(
             model, optimizer, train_dataloader, scheduler
         )
+        if research and config.training.scheduler_type == 'linear':
+            accelerator.register_for_checkpointing(scheduler)
         
         # Create trainer
         trainer = UniDiffuserTrainer(
@@ -711,11 +807,22 @@ def main():
         )
         
         # Start training
-        trainer.train(
-            max_steps=config.training.max_steps, 
-            resume_from=config.resume.checkpoint_path,
-            val_interval=config.system.val_interval
-        )
+        if args.diagnostic_eval_only:
+            from utils.research import load_research_bundle
+            load_research_bundle(accelerator.unwrap_model(model), args.diagnostic_eval_only)
+        else:
+            trainer.train(
+                max_steps=config.training.max_steps,
+                resume_from=config.resume.checkpoint_path,
+                val_interval=config.system.val_interval)
+        if research:
+            accelerator.wait_for_everyone()
+            if rank == 0:
+                from research_diagnostic import generate_diagnostic
+                generate_diagnostic(accelerator.unwrap_model(model), train_dataloader, config,
+                                    Path(config.system.checkpoint_dir) / ('fresh_reload' if args.diagnostic_eval_only else 'generation'),
+                                    reference_checkpoint=args.diagnostic_eval_only)
+            accelerator.wait_for_everyone()
         
     except Exception as e:
         logger.error(f"Training failed: {e}")

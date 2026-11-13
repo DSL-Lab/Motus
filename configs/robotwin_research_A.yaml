@@ -1,0 +1,59 @@
+# Matched dense A. Original configs/robotwin.yaml remains the legacy dense path.
+base_config: robotwin.yaml
+training_mode: finetune
+research:
+  enabled: true
+  phase: tiny
+  representation: dense
+  seed: 0
+  # Required existing artifacts, not assumed cluster paths.
+  window_manifest: ${oc.env:MOTUS_WINDOWS}
+  normalization_path: ${oc.env:MOTUS_NORMALIZATION}
+  knot_scaling_path: ${oc.env:MOTUS_KNOT_SCALING}
+  lora: {rank: 16, alpha: 32.0, dropout: 0.0}
+  diagnostic:
+    windows: 4
+    seeds: [0, 1, 2, 3]
+  pilot_defaults: {updates: 1000, effective_batch: 16, learning_rate: 0.0001}
+dataset:
+  dataset_dir: ${oc.env:MOTUS_DATASET_ROOT}
+  task_mode: single
+  task_name: place_can_basket
+  data_mode: clean
+  image_aug: false
+model:
+  load_pretrained_backbones: false
+  wan:
+    checkpoint_path: ${oc.env:MOTUS_WAN}
+    config_path: ${oc.env:MOTUS_WAN}
+    vae_path: ${oc.env:MOTUS_VAE}
+  vlm:
+    checkpoint_path: ${oc.env:MOTUS_VLM}
+  time_distribution:
+    # Existing training actually samples uniform scheduler indices (shifted
+    # sigma grid), independently for video/action. This label documents it.
+    timestep_sample_method: scheduler_index_uniform
+finetune:
+  checkpoint_path: ${oc.env:MOTUS_BASE_CHECKPOINT}
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 100
+  learning_rate: 0.0001
+  wan_learning_rate: 0.0001
+  # Diagnostic overrides: 100 rather than 1000 updates, effective batch 1
+  # rather than 16, ten warmup steps rather than the original 200.
+  warmup_steps: 10
+  cycle_length: 100
+  f_max: 1.0
+  f_min: 0.1
+system:
+  num_workers: 0
+  save_interval: 100
+  val_interval: 1000
+  checkpoint_dir: outputs/research-tiny
+logging:
+  report_to: none
+  run_name: tiny
+resume:
+  reset_scheduler: false
