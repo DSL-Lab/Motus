@@ -6,7 +6,7 @@ observations, language, optimizer, and rank-64 / alpha-128 LoRA. Adapter targets
 are `video_model.wan_model.*` and `action_expert.*`; VLM and Understanding remain
 frozen. The complete action input/output projections retain their full tuning.
 
-## Prepare and train
+## Prepare, train and evaluate
 
 Run from the Motus repository root. The cluster wrapper uses the existing
 Apptainer image and Python overlay; see [environment.sh](../../scripts/cluster/environment.sh).
@@ -19,10 +19,8 @@ bash scripts/cluster/environment.sh --cpu python ../WAM-RoboTwin/scripts/prepare
 MOTUS_PREP_FRESH=0 bash experiments/ac_spline_pilot/scripts/submit_prepare_clean50.sh --dry-run
 bash experiments/ac_spline_pilot/scripts/submit_full_pilot.sh --dry-run
 
-# Prepare/resume the corpus, then run A and C only after preparation succeeds.
-mkdir -p outputs
-prep_job=$(MOTUS_PREP_FRESH=0 sbatch --parsable experiments/ac_spline_pilot/scripts/submit_prepare_clean50.sh)
-sbatch --dependency="afterok:${prep_job}" experiments/ac_spline_pilot/scripts/submit_full_pilot.sh
+# One submission: reuse/prepare data, train A/C, then run both in RoboTwin.
+bash experiments/ac_spline_pilot/scripts/submit_full_pilot.sh --submit --task place_can_basket
 ```
 
 [Preparation](scripts/submit_prepare_clean50.sh) requests one L40S GPU, eight
@@ -31,10 +29,12 @@ videos, T5 embeddings from each episode's first seen instruction, canonical
 RoboTwin spline sidecars, training-only statistics, and aligned window manifests.
 The log is `outputs/ac_prepare_<job-id>.out`.
 
-Preparation starts fresh by default (`MOTUS_PREP_FRESH=1`). Under a process lock,
-cleanup removes only `outputs/ac_spline_pilot/clean50`; it refuses source paths,
-alternate output paths, and symlinked locations. Set `MOTUS_PREP_FRESH=0` to resume
-an identical source set instead. Raw recordings and job logs are preserved.
+The one-command submission forces preparation reuse (`MOTUS_PREP_FRESH=0`) and
+submits training/evaluation with `afterok` on preparation. Verified existing
+outputs are reused; missing preparation outputs are built. Source/contract
+mismatches fail instead of rebuilding datasets. The separate preparation script
+still supports its explicit guarded fresh mode. Raw recordings and checkpoints
+are preserved. This experiment currently supports `place_can_basket` only.
 
 [Training](scripts/submit_full_pilot.sh) requests one L40S GPU on
 `gpubase_l40s_b3`, eight CPUs, 64 GB RAM, and one day under account `aip-rjliao`.
@@ -42,9 +42,12 @@ It runs A then C, stopping if either fails. Each variant uses 1,000 optimizer
 updates, microbatch 1, accumulation 16, 200 warmup updates, a 1,000-update schedule,
 and checkpoints every 250 updates. `--report_to none` disables logging trackers;
 TensorBoard is optional. Logs are `outputs/ac_pilot_<job-id>.out`, with results
-under `outputs/ac_pilot_<job-id>/{A,C}`.
+under `outputs/ac_pilot_<job-id>/{A,C}`. After both finish, the same job evaluates
+both exact `checkpoint_step_1000` bundles through RoboTwin simulator rollouts;
+it never searches an older run or chooses a checkpoint by glob.
 
-If preparation is already complete, check the paths and submit training directly:
+If preparation is already complete, check the paths and submit training plus
+simulator evaluation directly:
 
 ```bash
 bash experiments/ac_spline_pilot/scripts/submit_full_pilot.sh --check
@@ -109,9 +112,11 @@ bash scripts/cluster/environment.sh --cpu env HF_HUB_OFFLINE=0 TRANSFORMERS_OFFL
   Generation previews use at most four windows; training still covers the
   complete 45-episode window set.
 
-## Evaluate existing A and C checkpoints
+## Offline diagnostics
 
-Training generates the original four-window, seeds-0–3 preview automatically.
+Training generates the original four-window, seeds-0–3 offline preview automatically.
+`generation/results.json` explicitly labels this as offline fixed-window
+generation. These predictions do not measure simulator task success.
 For fresh-process evaluation, run the following inside an existing Slurm GPU
 allocation. Use a new `eval_root`; the output guard rejects existing run paths.
 The saved, resolved checkpoint config supplies the original dataset/model paths,
@@ -146,9 +151,57 @@ bash scripts/cluster/environment.sh --cpu python -m data.robotwin2.redecode_pred
   --output outputs/ac_C_redecode_NEW
 ```
 
-These are offline prediction diagnostics. The legacy dense RoboTwin wrapper does
-not load research bundles; this workflow does not claim a Method C simulator
-rollout.
+The commands above are offline diagnostics only. The new simulator bridge below
+reconstructs research bundles; the legacy dense RoboTwin wrapper is unchanged.
+
+## Actual closed-loop RoboTwin evaluation
+
+The launcher now calls `python -m experiments.ac_spline_pilot.simulator` for A and
+C after training. [rollout_policy.py](rollout_policy.py) reconstructs the model
+using the saved config, loads the original frozen base and exact research
+adapter bundle with the existing strict loader, and uses training's RGB camera
+composition, image padding, raw state layout, T5 prompt and VLM preprocessing.
+T5 instructions are encoded before loading MOTUS so both large models need not
+remain on the GPU together. C uses the same running-maximum/endpoint/domain
+safeguards as offline decoding. Invalid prefixes fail the rollout without
+replacement commands, extrapolation, or retiming.
+
+[simulator.py](simulator.py) reuses RoboTwin's existing
+`eval_policy_xpolicylab.run_one_batch_episode`, observation conversion, action
+conversion, `take_action`/TOPP controller, scene success checks, command limit,
+and optional video logging. It runs in-process rather than starting a redundant
+policy server on the same GPU. No simulator controller or task reward was changed.
+
+Defaults are **100 episodes per variant**, evaluation seed **0**, clean task
+config, and its `seen` instruction setting. Override only the evaluation count
+and seed with `MOTUS_EVAL_EPISODES` and `MOTUS_EVAL_SEED` before submission.
+The evaluator expert-filters a single scene list beginning at RoboTwin's normal
+`100000 * (1 + seed)` offset, saves exact scene seeds and instructions once, then
+reuses it for both variants. Policy noise is seeded by scene/call while preserving
+simulator RNG state. No policy, setup or decoder failure replaces an assigned
+scene. These failures stay in the denominator; model/startup failures mark the
+run incomplete and fail the job. A failure in A evaluation still allows C's
+matched evaluation to be attempted.
+
+Each `outputs/ac_pilot_<job-id>/` contains:
+
+- `A/.../checkpoint_step_1000/`, `C/.../checkpoint_step_1000/`: this run's bundles.
+- `{A,C}/.../generation/`: **offline** previews and decoded prediction errors.
+- `simulator/cases.json`: shared expert-valid scenes/instructions and rejected
+  candidate seeds; both result files record its hash.
+- `simulator/{A,C}/results.json`: checkpoint/contract provenance, completion,
+  success/failure counts, success rate and load/total wall times.
+- `simulator/{A,C}/episodes.jsonl`: individual rollout outcomes, failure reasons,
+  executed commands, policy calls, per-call decoder reports, synchronized model
+  inference, policy/controller wall times and scene timestep.
+- `simulator/{A,C}/videos/`: videos when enabled by the existing task config.
+- `logs/train_{A,C}.log`, `logs/simulator_{A,C}.log`: persistent separate logs,
+  alongside Slurm's preparation and pipeline logs.
+
+Timing includes first-call overhead; this is not a warmed latency benchmark.
+A decoded source-row stride is not a physical clock, and a command is not a
+physics step. Scene timestep is reported; no unmeasured simulated duration or
+TOPP failure count is invented. Training wall time remains in the trainer logs.
 
 ## Verification
 
@@ -172,4 +225,47 @@ contract identities match, except for redundant copies of dataset options in
 `dataset.params`. The original Method C decoder replay report is identical.
 Local verification artifacts are `outputs/ac-cleanup-20261116/equivalence.json`
 and `outputs/ac-cleanup-20261116/redecode/results.json`. No preparation rebuild,
-training or GPU generation was run during cleanup.
+training or GPU generation was run during that cleanup. See the current rollout
+integration validation below for the subsequent simulator connection.
+
+
+## Rollout integration validation — 2026-11-16
+
+Before this change, `submit_full_pilot.sh` launched only A/C training, and
+`ACSplineFactory.run` ended with `generate_diagnostic`; it never invoked a
+simulator. The existing dense deployment wrapper could not load research
+bundles. The new connection above adds actual closed-loop execution.
+
+Passed: 44 full experiment regressions, 10 shared regressions, 24 decoder
+regressions, plus the subsequently added setup-failure test and the targeted
+adapter/launcher rerun. This covers training-compatible RGB/state/prompt inputs,
+exact requested-bundle loading, shared expert-selected scenes/instructions,
+fixed seeds after setup/decoder errors, existing rollout-loop success and
+failure handling, command counts/timing, missing-producer-checkpoint rejection,
+`afterok` submission with fake Slurm commands, and evaluating C after A errors.
+The real launcher `--dry-run` and saved-checkpoint `--check` also passed.
+
+A bounded live check used one L40S allocation, Slurm job **7675647**, and the
+existing `ac_pilot_7643090` step-1000 bundles. This was a test of the bridge;
+the production launcher derives future checkpoints from its own run directory.
+Both used the same expert-valid scene **100000** and exact saved instruction:
+
+| Policy | Simulator result | Commands | Policy calls | Episode wall time |
+| --- | --- | --- | --- | --- |
+| A | success | 82 | 6 | 73.83 s |
+| C | failure: invalid knot multiplicity or degenerate domain | 64 | 5 | 85.18 s |
+
+C executed four valid chunks, then rejected its fifth prediction. No replacement
+commands were issued. This verifies actual scene creation, both full checkpoint
+loads, observation-conditioned policy inference, decoder integration, RoboTwin
+controller execution, task success/failure recording and videos. One scene is
+an integration smoke test, not a task-success comparison.
+
+Artifacts: `outputs/ac-rollout-integration/smoke_7675647/{A,C}/results.json`,
+`episodes.jsonl`, videos and logs; shared `cases.json`; compact
+`outputs/ac-rollout-integration/validation.json`. Cold model/language load and
+scene-selection time are recorded separately from per-episode policy/controller
+timing. The full new prepare/train/100-episode-per-policy pipeline has **not**
+been launched or validated end to end, as requested. The full submission chain
+and its current-run checkpoint handoff were tested with fake Slurm/training
+processes; the live smoke used existing checkpoints and did not retrain.

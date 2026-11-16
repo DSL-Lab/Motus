@@ -94,7 +94,7 @@ def generate_diagnostic(model, dataloader, config, output, reference_checkpoint=
     raw, decoded = np.asarray(raw), np.asarray(decoded)
     np.savez_compressed(output / 'predictions.npz', raw_parameters=raw, decoded_commands=decoded,
                         target_commands=np.asarray(targets), seeds=seeds, window_ids=sample_ids)
-    report = dict(contract_identity=contract['identity'], model='full MOTUS', real_windows=count,
+    report = dict(evaluation='offline fixed-window generation', contract_identity=contract['identity'], model='full MOTUS', real_windows=count,
                   representation=contract['representation'], seeds=seeds, records=records,
                   valid_fraction=float(np.mean([r['full_prefix_valid'] for r in records])),
                   raw_valid_fraction=float(np.mean([r.get('raw_full_prefix_valid', r['full_prefix_valid']) for r in records])),

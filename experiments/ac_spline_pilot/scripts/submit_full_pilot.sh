@@ -18,13 +18,23 @@
 set -euo pipefail
 check_only=false
 dry_run=false
-if [[ $# == 1 && ( "$1" == --check || "$1" == --dry-run ) ]]; then
-    check_only=true
-    [[ "$1" != --dry-run ]] || dry_run=true
-elif (( $# != 0 )); then
-    echo 'Usage: bash submit_full_pilot.sh --check|--dry-run | sbatch submit_full_pilot.sh' >&2
-    exit 2
-fi
+submit=false
+task=place_can_basket
+while (( $# )); do
+    case "$1" in
+        --task) task="${2:?--task needs a task name}"; shift 2 ;;
+        --check|--dry-run|--submit)
+            if "$check_only"; then echo 'Choose one of --check, --dry-run or --submit' >&2; exit 2; fi
+            check_only=true
+            case "$1" in --dry-run) dry_run=true ;; --submit) submit=true ;; esac
+            shift ;;
+        *) echo 'Usage: submit_full_pilot.sh [--submit|--check|--dry-run] [--task place_can_basket]' >&2; exit 2 ;;
+    esac
+done
+[[ "$task" == place_can_basket ]] || { echo 'Current A/C experiment supports place_can_basket only' >&2; exit 2; }
+episodes="${MOTUS_EVAL_EPISODES:-100}"
+eval_seed="${MOTUS_EVAL_SEED:-0}"
+[[ "$episodes" =~ ^[1-9][0-9]*$ && "$eval_seed" =~ ^[0-9]+$ ]] || { echo 'Invalid evaluation episode count or seed' >&2; exit 2; }
 if "$check_only"; then
     # Direct execution keeps the real script path; Slurm copies batch scripts.
     script_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)
@@ -58,6 +68,10 @@ for name in MOTUS_DATASET_ROOT MOTUS_WINDOWS MOTUS_NORMALIZATION MOTUS_KNOT_SCAL
             MOTUS_BASE_CHECKPOINT MOTUS_WAN MOTUS_VAE MOTUS_VLM; do
     # Apptainer --cleanenv needs the same checked asset values explicitly.
     container_env+=("$name=${!name}")
+    # Preparation produces these four paths before the dependent training job.
+    if { "$submit" || "$dry_run"; } && [[ "$name" == MOTUS_DATASET_ROOT || "$name" == MOTUS_WINDOWS || "$name" == MOTUS_NORMALIZATION || "$name" == MOTUS_KNOT_SCALING ]]; then
+        continue
+    fi
     if [[ ! -e "${!name}" ]]; then
         echo "Missing $name: ${!name}. Set this variable to the prepared artifact before sbatch." >&2
         missing_assets=$((missing_assets + 1))
@@ -67,10 +81,17 @@ if (( missing_assets )); then
     echo "$missing_assets required artifact paths are missing. Raw HDF5 demos require preprocessing; they cannot be used as MOTUS_DATASET_ROOT." >&2
     exit 2
 fi
-[[ -d "$MOTUS_DATASET_ROOT/clean/place_can_basket/qpos" ]] || {
+if "$submit"; then
+    mkdir -p outputs
+    prep_job=$(MOTUS_PREP_FRESH=0 sbatch --parsable experiments/ac_spline_pilot/scripts/submit_prepare_clean50.sh)
+    echo "Preparation job: $prep_job (reuse enabled); training/evaluation depends on its success."
+    exec sbatch --dependency="afterok:${prep_job%%;*}" \
+        experiments/ac_spline_pilot/scripts/submit_full_pilot.sh --task "$task"
+fi
+if ! "$dry_run" && [[ ! -d "$MOTUS_DATASET_ROOT/clean/place_can_basket/qpos" ]]; then
     echo 'MOTUS_DATASET_ROOT must contain clean/place_can_basket/qpos (50 complete episodes)' >&2
     exit 2
-}
+fi
 
 if "$check_only" && ! "$dry_run"; then
     echo 'Artifact paths exist. This path-only check does not load models or submit a job.'
@@ -80,11 +101,15 @@ fi
 
 run_root="${MOTUS_PILOT_OUTPUT:-$PWD/outputs/ac_pilot_${SLURM_JOB_ID:-DRY_RUN}}"
 if ! "$dry_run"; then
-    mkdir -p "$run_root"
+    mkdir -p "$(dirname "$run_root")"
+    mkdir "$run_root"
+    mkdir "$run_root/logs"
 fi
 
 if "$dry_run"; then
-    echo 'Dry run: the following commands will not execute.'
+    echo 'Dry run: no jobs or commands will execute. --submit schedules preparation, then this job afterok.'
+    echo 'MOTUS_PREP_FRESH=0 sbatch --parsable experiments/ac_spline_pilot/scripts/submit_prepare_clean50.sh'
+    echo 'sbatch --dependency=afterok:<PREPARATION_JOB_ID> experiments/ac_spline_pilot/scripts/submit_full_pilot.sh --task place_can_basket'
 else
     echo "Starting matched A/C pilot job $SLURM_JOB_ID at $(date -Is)"
 fi
@@ -101,8 +126,29 @@ for variant in A C; do
         printf '%q ' "${command[@]}"
         printf '\n'
     else
-        "${command[@]}"
+        "${command[@]}" 2>&1 | tee "$run_root/logs/train_${variant}.log"
+        checkpoint="$run_root/$variant/robotwin_pilot_$variant/pilot-seed-0/checkpoint_step_1000"
+        [[ -f "$checkpoint/research_adapter.pt" && -f "$checkpoint/research_config.json" ]] || {
+            echo "Training did not produce its final checkpoint: $checkpoint" >&2; exit 2;
+        }
     fi
 
 done
-if ! "$dry_run"; then echo "Both pilot variants completed at $(date -Is)"; fi
+# These are real closed-loop rollouts. generation/ above remains offline diagnostics.
+eval_status=0
+for variant in A C; do
+    checkpoint="$run_root/$variant/robotwin_pilot_$variant/pilot-seed-0/checkpoint_step_1000"
+    command=(srun --ntasks=1 --gpus=1 --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}"
+        bash scripts/cluster/environment.sh --gpu env "OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}"
+        python -u -m experiments.ac_spline_pilot.simulator --task "$task"
+        --checkpoint "$checkpoint" --cases "$run_root/simulator/cases.json"
+        --episodes "$episodes" --seed "$eval_seed" --output "$run_root/simulator/$variant")
+    if "$dry_run"; then
+        printf '%q ' "${command[@]}"; printf '\n'
+    elif ! "${command[@]}" 2>&1 | tee "$run_root/logs/simulator_${variant}.log"; then
+        # Preserve the error and still attempt the matched other variant.
+        eval_status=1
+    fi
+done
+if ! "$dry_run"; then echo "A/C training and simulator evaluation finished at $(date -Is), status=$eval_status"; fi
+exit "$eval_status"
