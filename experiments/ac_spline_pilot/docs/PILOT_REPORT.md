@@ -1,12 +1,24 @@
 # Place Can Basket pilot — prerequisite audit
 
+> Historical research notes. Earlier commands, gates, and parameter counts
+> describe previous stages. Use the [experiment README](../README.md)
+> for the maintained preparation and training workflow.
+
+
+Current configuration update: both variants require exactly 50 complete clean
+`place_can_basket` demonstrations with the standard seed-0 45/5 split. They use
+LoRA rank 64 / alpha 128 / dropout 0 on WAN and Action linears only, plus
+`--report_to none`. The full manifest covers every episode; four windows limit
+only generation previews. Earlier scope/count restrictions and unresolved scope
+discussions below are historical evidence, not the current configuration.
+
 **Status: blocked before deployment/training; no jobs submitted or running.**
 Task identifier `place_can_basket` is verified in the installed module/class and
 instruction file. Scope remains original checkpoint, dense A, spline C, seed 0.
 Audit artifacts were captured 2026-11-13 UTC (workspace session date 2026-11-12).
 
-Previous-stage evidence was inspected in `data/robotwin2/ADAPTIVE_SPLINE.md`,
-`data/robotwin2/LOCAL_SPLINE.md`, `RESEARCH_TRAINING.md` and their retained outputs.
+Previous-stage evidence was inspected in `experiments/ac_spline_pilot/docs/ADAPTIVE_SPLINE.md`,
+`experiments/ac_spline_pilot/docs/LOCAL_SPLINE.md`, `experiments/ac_spline_pilot/docs/RESEARCH_TRAINING.md` and their retained outputs.
 Conversion/local extraction and checkpoint reload results are **synthetic/CPU
 component evidence**. Real conversion, simulator replay, tiny-data learning and
 full-model fresh reload were never executed. The pilot readiness gate remains.
@@ -70,7 +82,7 @@ Unresolved prerequisites, in execution order:
    target, execute matched replay, then run the existing varied-noise tiny A/C
    diagnostic and full-model fresh reload. Resolve insufficient 36-row coverage
    and VAE masking failures without silently changing the execution horizon.
-   `train/train.py` still rejects pilot phase/>100 updates; `load_contract` still
+   `experiments/ac_spline_pilot/train.py` still rejects pilot phase/>100 updates; `load_contract` still
    permits only four tiny training windows. No bypass was introduced.
 5. **Research deployment/metrics:** adapter bundle loading, shared spline decoder
    integration, fixed-step execution, warmed CUDA-synchronized latency/memory,
@@ -105,10 +117,10 @@ Candidate configuration, **not launch-ready**:
 Commands actually executed from `Motus` (all listed tests passed):
 
 ```powershell
-py -3.13 train/test_research.py -v
+py -3.13 experiments/ac_spline_pilot/tests/test_research.py -v
 py -3.13 -m unittest discover -s data/robotwin2 -p test_adaptive_spline.py -v
 py -3.13 -m unittest discover -s tests -p test_robotwin_deployment_contract.py -v
-py -3.13 scripts/prepare_single_task_pilot.py --task place_can_basket --representation both --seed 0 --updates 1000 --output outputs/stage4-preparation-20261112
+py -3.13 experiments/ac_spline_pilot/scripts/prepare_single_task_pilot.py --task place_can_basket --representation both --seed 0 --updates 1000 --output outputs/stage4-preparation-20261112
 git diff --check
 ```
 
@@ -116,7 +128,7 @@ Artifacts: `outputs/stage4-preparation-20261112/{readiness.json,pending-jobs.jso
 source-identities.json,validation.json}` and `source/{Motus,WAM-RoboTwin}/`.
 Candidate training commands/config paths and exclusive future output directories
 are recorded in `pending-jobs.json`. They were **not executed** and the current
-trainer deliberately refuses them. Existing `scripts/slurm/run_tiny_research.sh`
+trainer deliberately refuses them. Existing `experiments/ac_spline_pilot/scripts/run_tiny_research.sh`
 is retained for approved allocated-node prerequisite diagnostics; the existing
 8-GPU/1.5-TB Slurm template has placeholder settings and is not reused as verified
 resource evidence. Frozen snapshots must be regenerated after necessary fixes

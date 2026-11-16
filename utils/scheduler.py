@@ -45,6 +45,11 @@ class LambdaLinearScheduler:
         assert cycle_length > warm_up_steps, "cycle_length must be greater than warm_up_steps"
         assert f_max >= f_min, "f_max must be >= f_min"
         assert f_start >= 0, "f_start must be non-negative"
+        # The optimizer runs before scheduler.step(). Initialize its first
+        # update too; otherwise it takes one full-LR step before warmup starts.
+        initial_multiplier = self.f_start if self.warm_up_steps else self.f_max
+        for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            group['lr'] = base_lr * initial_multiplier
         
     def step(self):
         """Update learning rates for next step (supports multiple param groups)"""

@@ -2,7 +2,7 @@
 
 Shared episode math and sidecars live in the installed robotwin_spline package.
 Import generic utilities from robotwin_spline directly.
-See RESEARCH_TRAINING.md for setup.
+See experiments/ac_spline_pilot/docs/RESEARCH_TRAINING.md for setup.
 """
 import numpy as np
 from robotwin_spline import identity, read_cache
@@ -162,7 +162,8 @@ def fit_knot_time_scaling(caches):
 def select_future_frames(sample, action_times, camera_times, *, count=8, knot_offset=1, knot_stride=4):
     """Knot indices 3+offset+i*stride; nearest camera timestamp, earlier tie.
 
-    Arrays must use the same explicitly declared clock (seconds on real data).
+    Arrays must use the same declared axis: verified seconds or recorded-row indices.
+    Recorded rows do not assert a physical controller clock.
     Repeated tail/support requests are held at the last evaluable knot and
     masked. No inference from video FPS is made here.
     """

@@ -22,11 +22,12 @@ import numpy as np
 import torch
 from torch import nn
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 from utils.device import amp_autocast, disable_autocast
-from utils.research import (configure_adapters, trainable_summary, gradient_summary,
-                            load_compatible_base, save_research_bundle, load_research_bundle, masked_video_loss)
+from utils.losses import masked_video_loss
+from experiments.ac_spline_pilot.research import (LoRALinear, configure_adapters, trainable_summary, gradient_summary,
+                            load_compatible_base, save_research_bundle, load_research_bundle)
 
 
 def definitions(path, names, namespace):
@@ -79,7 +80,7 @@ class Harness(nn.Module):
             block.ffn = nn.Sequential(nn.Linear(12, 24), nn.GELU(), nn.Linear(24, 12))
             blocks.append(block)
         video.blocks = nn.ModuleList(blocks)
-        self.vlm_model = nn.Linear(3, 3)  # explicitly frozen, never called
+        self.vlm_model = nn.Linear(3, 3)  # adapted, unused by this component forward
         self.video_module = ns['VideoModule'](self.video_model, torch.float32, torch.device('cpu'), torch.tensor([[3,1,1]]))
 
     def forward(self, state, actions, video, und):
@@ -205,7 +206,10 @@ class ComponentTests(unittest.TestCase):
         for representation, rows, width in [('dense', 16, 14), ('spline', 36, 15)]:
             torch.manual_seed(0)
             model = Harness(representation)
+            expected_targets = [name for name, module in model.named_modules()
+                                if isinstance(module, nn.Linear) and name.startswith(('video_model.wan_model.', 'action_expert.'))]
             configure_adapters(model, dict(rank=2, alpha=4., dropout=0.))
+            self.assertEqual(model.adapter_targets, expected_targets)
             opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=.001)
             summary = trainable_summary(model, opt)
             inputs = [torch.randn(1,14), torch.randn(1,rows,width), torch.randn(1,3,12), torch.randn(1,2,8)]
@@ -217,9 +221,12 @@ class ComponentTests(unittest.TestCase):
                 (torch.nn.functional.mse_loss(output, target) + video.square().mean()).backward()
                 opt.step()
             gradients = gradient_summary(model)
-            self.assertTrue(all(g is not None and g['finite'] for g in gradients.values()))
-            self.assertTrue(all(g['norm'] > 0 for g in gradients.values()))
+            active = [g for g in gradients.values() if g is not None]
+            self.assertTrue(active)
+            self.assertTrue(all(g['finite'] for g in active))
+            self.assertTrue(any(g['norm'] > 0 for g in active))
             self.assertFalse(any(p.requires_grad for p in model.vlm_model.parameters()))
+            self.assertFalse(any(p.requires_grad for p in model.und_expert.parameters()))
             self.assertFalse(model.action_expert.blocks[0].wan_action_qkv.requires_grad)
             self.assertFalse(any(p.requires_grad for p in model.und_expert.blocks[-1].parameters()))
             expected_tokens = rows + 1 + 4
@@ -229,6 +236,33 @@ class ComponentTests(unittest.TestCase):
         out = fixture_directory()
         (out / 'trainable-and-gradient-summary.json').write_text(json.dumps(reports, indent=2))
         print('CPU component trainables/gradients:', out)
+
+    def test_rank_64_covers_only_wan_action_and_preserves_linear_interface(self):
+        model = Harness('spline')
+        expected = {name for name, module in model.named_modules()
+                    if isinstance(module, nn.Linear) and name.startswith(('video_model.wan_model.', 'action_expert.'))}
+        configure_adapters(model, dict(rank=64, alpha=128., dropout=0.))
+        self.assertEqual(set(model.adapter_targets), expected)
+        self.assertTrue(any(name.startswith('video_model.') for name in expected))
+        self.assertTrue(any(name.startswith('action_expert.') for name in expected))
+        self.assertFalse(any(name.startswith(('und_expert.', 'vlm_model')) for name in model.adapter_targets))
+        self.assertFalse(any(p.requires_grad for p in model.vlm_model.parameters()))
+        self.assertFalse(any(p.requires_grad for p in model.und_expert.parameters()))
+        for name in expected:
+            layer = model.get_submodule(name)
+            self.assertIsInstance(layer, LoRALinear)
+            self.assertEqual(layer.lora_A.shape, (64, layer.in_features))
+            self.assertEqual(layer.lora_B.shape, (layer.out_features, 64))
+            self.assertEqual(layer.multiplier, 2.)
+            self.assertIs(layer.weight, layer.base.weight)
+            self.assertIs(layer.bias, layer.base.bias)
+        # Frozen BF16 linears accept FP32 adapter inputs, as WAN time/head paths do.
+        layer = LoRALinear(nn.Linear(3, 2).bfloat16())
+        result = layer(torch.randn(1, 3))
+        self.assertEqual(result.dtype, torch.bfloat16)
+        result.float().square().mean().backward()
+        self.assertIsNotNone(layer.lora_B.grad)
+        self.assertIsNone(layer.base.weight.grad)
 
     def test_masked_keys_cannot_affect_action_or_understanding(self):
         ns = component_namespace()

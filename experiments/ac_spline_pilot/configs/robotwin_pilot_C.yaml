@@ -1,0 +1,4 @@
+# Same corpus, seed, adapters and schedule as dense A; native spline targets.
+base_config: robotwin_pilot_A.yaml
+research:
+  representation: spline

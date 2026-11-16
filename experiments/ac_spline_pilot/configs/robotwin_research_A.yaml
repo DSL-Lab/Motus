@@ -1,6 +1,6 @@
 # Matched dense A. configs/robotwin.yaml retains the original dense path.
-# Requires installed robotwin-spline for research sidecars; see RESEARCH_TRAINING.md.
-base_config: robotwin.yaml
+# Requires installed robotwin-spline for research sidecars; see ../docs/RESEARCH_TRAINING.md.
+base_config: ../../../configs/robotwin.yaml
 training_mode: finetune
 research:
   enabled: true
@@ -11,7 +11,12 @@ research:
   window_manifest: ${oc.env:MOTUS_WINDOWS}
   normalization_path: ${oc.env:MOTUS_NORMALIZATION}
   knot_scaling_path: ${oc.env:MOTUS_KNOT_SCALING}
-  lora: {rank: 16, alpha: 32.0, dropout: 0.0}
+  split_seed: 0
+  lora:
+    rank: 64
+    alpha: 128.0
+    dropout: 0.0
+    target_modules: ["video_model.wan_model.*", "action_expert.*"]
   diagnostic:
     windows: 4
     seeds: [0, 1, 2, 3]
@@ -21,6 +26,7 @@ dataset:
   task_mode: single
   task_name: place_can_basket
   data_mode: clean
+  max_episodes: 50
   image_aug: false
 model:
   load_pretrained_backbones: false

@@ -61,9 +61,6 @@ def create_dataset(config: OmegaConf, val: bool = False):
         
         # Set validation flag
         params['val'] = val
-        if config.get('research', {}).get('enabled', False):
-            params['window_manifest'] = config.research.window_manifest
-            params['research_contract'] = OmegaConf.to_container(config.research.contract, resolve=True)
         
         return RobotWinTaskDataset(**params)
     

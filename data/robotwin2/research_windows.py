@@ -6,57 +6,104 @@ from pathlib import Path
 import numpy as np
 
 from robotwin_spline import read_cache, identity, normalize, decode
+from robotwin_spline.sidecar import VERSION
 from .adaptive_spline import extract_local, decode_local, select_future_frames
+
+
+def prepare_window(spline, obs, scaling, normalization, action_times, camera_times):
+    """Build and validate one fixed A/C window for preparation and loading."""
+    if not isinstance(obs, int) or not 0 <= obs < len(action_times):
+        raise ValueError("Observation must be an original source-row integer index")
+    packet = extract_local(spline, obs, scaling)
+    # Check the actual packed target against its global parent before it can
+    # reach training. The original command grid remains stride three.
+    dense_indices = np.minimum(obs + 3 * np.arange(1, 17), len(action_times) - 1)
+    target_decoded, _ = decode_local(packet["parameters"], dense_indices, obs, scaling, normalization)
+    if not np.allclose(target_decoded, decode(spline(dense_indices), normalization), atol=2e-5, rtol=0):
+        raise ValueError("Local/global packed-target round trip failed")
+    selection = select_future_frames(packet, action_times, camera_times)
+    if selection['current_camera_timestamp'] > selection['current_timestamp']:
+        raise ValueError('Nearest current camera frame lies in the future; select a causal observation window')
+    if not any(selection["proposed_latent_loss_mask"]):
+        raise ValueError("Window has no valid future latent under conservative causal VAE mask")
+    return packet, dense_indices, selection
+
+
+def _load_episode(window, expected, train_keys, val):
+    """Validate immutable episode inputs once per manifest load."""
+    actions, spline, meta = read_cache(window["cache_path"])
+    if (meta.get("schema") != VERSION or meta.get("cache_identity") !=
+            identity({k: v for k, v in meta.items() if k != "cache_identity"})):
+        raise ValueError("Incompatible or modified spline cache metadata; regenerate with robotwin_spline.convert")
+    if not meta["diagnostics"]["success"] or meta["normalization"] != expected:
+        raise ValueError("Failed fit or inconsistent training normalization")
+    if hashlib.sha256(actions.tobytes()).hexdigest() != meta['source']['action_sha256']:
+        raise ValueError('Cached commands do not match their source identity')
+    tolerance = meta['diagnostics']['settings']['tolerance']
+    if tolerance > .01 or np.abs(spline(np.arange(len(actions))) - normalize(actions, expected)).max() > tolerance:
+        raise ValueError('Stage-1 reconstruction check failed on this episode')
+    key = (meta["source"]["path"], meta["source"]["action_sha256"])
+    if (key in train_keys) == val:
+        raise ValueError("Episode leaks across the fixed training/validation split")
+    if val and meta["source"]["path"] not in expected["validation_paths"]:
+        raise ValueError("Unknown validation episode")
+    timeline = json.loads(Path(window["timeline_path"]).read_text())
+    if (timeline.get("status") != "verified" or timeline.get("units") not in ("seconds", "source_action_step")
+            or timeline.get("action_sha256") != meta["source"]["action_sha256"]):
+        raise ValueError("Unverified or mismatched action/camera clock")
+    if timeline['units'] == 'source_action_step':
+        alignment = timeline.get('alignment', {})
+        if (timeline.get('identity') != identity({key: value for key, value in timeline.items() if key != 'identity'})
+                or alignment.get('kind') != 'hdf5_recorded_rows' or alignment.get('source_format') != 'v1.0'
+                or alignment.get('rows') != len(actions) or alignment.get('extra_action_shift') != 0
+                or str(Path(alignment.get('qpos_path', '')).resolve()) != str(Path(window['qpos_path']).resolve())
+                or not np.array_equal(timeline.get('action_times'), np.arange(len(actions)))
+                or not np.array_equal(timeline.get('camera_times'), np.arange(len(actions)))):
+            raise ValueError('Unverified recorded-row alignment')
+    if len(timeline["action_times"]) != len(actions):
+        raise ValueError("Action clock length mismatch")
+    for name in ("action_times", "camera_times"):
+        times = np.asarray(timeline[name], dtype=float)
+        if (times.ndim != 1 or not len(times) or not np.isfinite(times).all()
+                or np.any(np.diff(times) < 0)):
+            raise ValueError(f"Invalid {name}: expected finite, ordered timestamps")
+    return actions, spline, meta, timeline
 
 
 def load_windows(path, val, contract):
     manifest = json.loads(Path(path).read_text())
     if manifest.get("schema") != "motus-fixed-real-windows-v1":
         raise ValueError("Expected explicit fixed real-observation window manifest")
+    # Reject leakage across the entire manifest, even when only one split is
+    # requested. Symlink aliases must not disguise the same episode.
+    membership = {}
+    for window in manifest["windows"]:
+        if window["split"] not in ("train", "validation"):
+            raise ValueError("Unknown window split; test episodes must not enter training manifests")
+        key = str(Path(window["qpos_path"]).resolve())
+        if key in membership and membership[key] != window["split"]:
+            raise ValueError("Episode leaks across train/validation manifest entries")
+        membership[key] = window["split"]
     windows = [w for w in manifest["windows"] if w["split"] == ("validation" if val else "train")]
     if not windows:
         raise ValueError("Window manifest has no requested split")
     expected = contract["normalization"]
     train_keys = {(s["path"], s["action_sha256"]) for s in expected["training_sources"]}
+    episodes = {}
     for window in windows:
         for key in ("qpos_path", "video_path", "lang_path", "cache_path", "timeline_path"):
             if not Path(window[key]).is_file():
                 raise FileNotFoundError(window[key])
         if Path(window["qpos_path"]).suffix != ".pt":
             raise ValueError("Real research windows must use audited original MOTUS PT data, not synthetic NPY fixtures")
-        actions, spline, meta = read_cache(window["cache_path"])
-        if not meta["diagnostics"]["success"] or meta["normalization"] != expected:
-            raise ValueError("Failed fit or inconsistent training normalization")
-        if hashlib.sha256(actions.tobytes()).hexdigest() != meta['source']['action_sha256']:
-            raise ValueError('Cached commands do not match their source identity')
-        tolerance = meta['diagnostics']['settings']['tolerance']
-        if tolerance > .01 or np.abs(spline(np.arange(len(actions))) - normalize(actions, expected)).max() > tolerance:
-            raise ValueError('Stage-1 reconstruction check failed on this episode')
-        key = (meta["source"]["path"], meta["source"]["action_sha256"])
-        if (key in train_keys) == val:
-            raise ValueError("Episode leaks across the fixed training/validation split")
-        if val and meta["source"]["path"] not in expected["validation_paths"]:
-            raise ValueError("Unknown validation episode")
-        timeline = json.loads(Path(window["timeline_path"]).read_text())
-        if timeline.get("status") != "verified" or timeline.get("units") != "seconds" or timeline.get("action_sha256") != meta["source"]["action_sha256"]:
-            raise ValueError("Unverified or mismatched action/camera clock")
-        if len(timeline["action_times"]) != len(actions):
-            raise ValueError("Action clock length mismatch")
-        obs = window["observation_index"]
-        if not isinstance(obs, int) or not 0 <= obs < len(actions):
-            raise ValueError("Observation must be an original source-row integer index")
-        packet = extract_local(spline, obs, contract["knot_scaling"])
-        # Check the actual packed target against its global parent before it can
-        # reach training. The original command grid remains stride three.
-        dense_indices = np.minimum(obs + 3 * np.arange(1, 17), len(actions) - 1)
-        target_decoded, _ = decode_local(packet["parameters"], dense_indices, obs, contract["knot_scaling"], expected)
-        if not np.allclose(target_decoded, decode(spline(dense_indices), expected), atol=2e-5, rtol=0):
-            raise ValueError("Local/global packed-target round trip failed")
-        selection = select_future_frames(packet, timeline["action_times"], timeline["camera_times"])
-        if selection['current_camera_timestamp'] > selection['current_timestamp']:
-            raise ValueError('Nearest current camera frame lies in the future; select a causal observation window')
-        if not any(selection["proposed_latent_loss_mask"]):
-            raise ValueError("Window has no valid future latent under conservative causal VAE mask")
+        key = tuple(str(Path(window[name]).resolve()) for name in
+                    ("qpos_path", "cache_path", "timeline_path"))
+        if key not in episodes:
+            episodes[key] = _load_episode(window, expected, train_keys, val)
+        actions, spline, meta, timeline = episodes[key]
+        packet, dense_indices, selection = prepare_window(
+            spline, window["observation_index"], contract["knot_scaling"], expected,
+            timeline["action_times"], timeline["camera_times"])
         # Cache only the explicit target and clock metadata, never image arrays.
         window["_packet"], window["_selection"] = packet, selection
         window["_dense_indices"], window["_actions"] = dense_indices, actions

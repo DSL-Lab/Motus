@@ -922,7 +922,7 @@ class Motus(nn.Module):
             video_pred_masked[:, :, 0:1] = 0
             video_loss = torch.nn.functional.mse_loss(video_pred_masked, video_target, reduction='mean')
             if video_latent_valid is not None and self.config.action_representation == 'spline':
-                from utils.research import masked_video_loss
+                from utils.losses import masked_video_loss
                 video_loss = masked_video_loss(video_pred, video_target, video_latent_valid)
         
             # Action loss

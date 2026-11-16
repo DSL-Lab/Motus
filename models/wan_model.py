@@ -56,7 +56,10 @@ class WanVideoModel(nn.Module):
         }[precision]
         
         # Initialize WAN model
-        self.wan_model = WanModel(**model_config)
+        # Diffusers config files include bookkeeping fields that are not
+        # constructor arguments (for example _class_name and _diffusers_version).
+        architecture = {key: value for key, value in model_config.items() if not key.startswith('_')}
+        self.wan_model = WanModel(**architecture)
         self.wan_model.to(device=self.device, dtype=self.precision)
 
         # Initialize VAE

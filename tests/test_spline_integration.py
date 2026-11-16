@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 import uuid
 
 import numpy as np
@@ -31,7 +32,7 @@ class SplineIntegrationChecks(unittest.TestCase):
 
     def test_training_and_deployment_share_evaluator(self):
         root = Path(__file__).resolve().parents[1]
-        contract_tree = ast.parse((root / 'utils/research.py').read_text())
+        contract_tree = ast.parse((root / 'experiments/ac_spline_pilot/research.py').read_text())
         entry = next(n.value for n in ast.walk(contract_tree) if isinstance(n, ast.Constant)
                      and n.value == 'data.robotwin2.adaptive_spline.decode_local')
         module, function = entry.rsplit('.', 1)
@@ -39,7 +40,7 @@ class SplineIntegrationChecks(unittest.TestCase):
         self.assertIs(research_windows.decode_local, decoder)
         self.assertIs(adapter.evaluate_local, shared.evaluate_local)
         # Resolve the actual stored decoder contract used by diagnostics.
-        source = Path(__file__).resolve().parents[1] / 'train/research_diagnostic.py'
+        source = Path(__file__).resolve().parents[1] / 'experiments/ac_spline_pilot/diagnostic.py'
         tree = ast.parse(source.read_text())
         imports = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
                    and n.module == 'data.robotwin2.adaptive_spline']
@@ -72,11 +73,42 @@ class SplineIntegrationChecks(unittest.TestCase):
                       timeline_path=str(root / 'timeline.json'), observation_index=0)
         manifest = root / 'windows.json'
         manifest.write_text(json.dumps(dict(schema='motus-fixed-real-windows-v1', windows=[window])))
-        loaded = research_windows.load_windows(manifest, False, contract)[0]
+        # Multiple observations share episode provenance/reconstruction checks,
+        # while retaining independent packed targets, clocks and identities.
+        manifest.write_text(json.dumps(dict(schema='motus-fixed-real-windows-v1',
+                                            windows=[window, dict(window, observation_index=8)])))
+        with patch.object(research_windows, 'read_cache', wraps=shared.read_cache) as reads:
+            loaded_windows = research_windows.load_windows(manifest, False, contract)
+        self.assertEqual(reads.call_count, 1)
+        self.assertEqual(len(loaded_windows), 2)
+        self.assertNotEqual(loaded_windows[0]['identity'], loaded_windows[1]['identity'])
+        self.assertIs(loaded_windows[0]['_actions'], loaded_windows[1]['_actions'])
+        loaded = loaded_windows[0]
+        manifest.write_text(json.dumps(dict(schema='motus-fixed-real-windows-v1', windows=[window])))
         np.testing.assert_array_equal(research_windows.window_targets(loaded, 'spline')['actions'],
                                       adapter.extract_local(spline, 0, contract['knot_scaling'])['parameters'])
         np.testing.assert_array_equal(research_windows.window_targets(loaded, 'dense')['actions'],
                                       commands[np.arange(3, 49, 3)].astype(np.float32))
+        row_timeline = dict(status='verified', units='source_action_step',
+                            action_sha256=meta['source']['action_sha256'],
+                            action_times=list(range(len(commands))), camera_times=list(range(len(commands))),
+                            alignment=dict(kind='hdf5_recorded_rows', source_format='v1.0',
+                                           rows=len(commands), extra_action_shift=0,
+                                           qpos_path=str((root / 'source.pt').resolve())))
+        row_timeline['identity'] = shared.identity(row_timeline)
+        (root / 'timeline.json').write_text(json.dumps(row_timeline))
+        row_loaded = research_windows.load_windows(manifest, False, contract)[0]
+        self.assertEqual(row_loaded['_selection']['current_camera_index'], 0)
+        row_timeline['alignment']['extra_action_shift'] = 1
+        row_timeline['identity'] = shared.identity({key: value for key, value in row_timeline.items() if key != 'identity'})
+        (root / 'timeline.json').write_text(json.dumps(row_timeline))
+        with self.assertRaisesRegex(ValueError, 'recorded-row alignment'):
+            research_windows.load_windows(manifest, False, contract)
+        (root / 'timeline.json').write_text(json.dumps(timeline))
+        duplicate = dict(window, split='validation')
+        manifest.write_text(json.dumps(dict(schema='motus-fixed-real-windows-v1', windows=[window, duplicate])))
+        with self.assertRaisesRegex(ValueError, 'leaks'):
+            research_windows.load_windows(manifest, False, contract)
         window['split'] = 'validation'
         manifest.write_text(json.dumps(dict(schema='motus-fixed-real-windows-v1', windows=[window])))
         with self.assertRaisesRegex(ValueError, 'leaks'):
@@ -88,6 +120,13 @@ class SplineIntegrationChecks(unittest.TestCase):
         contents['actions'][0, 0] += 1
         np.savez_compressed(cache, **contents)
         with self.assertRaisesRegex(ValueError, 'source identity'):
+            research_windows.load_windows(manifest, False, contract)
+        contents['actions'][0, 0] -= 1
+        metadata = json.loads(str(contents['metadata']))
+        metadata['time']['seconds_per_step'] = .1
+        contents['metadata'] = np.array(json.dumps(metadata))
+        np.savez_compressed(cache, **contents)
+        with self.assertRaisesRegex(ValueError, 'cache metadata'):
             research_windows.load_windows(manifest, False, contract)
 
 

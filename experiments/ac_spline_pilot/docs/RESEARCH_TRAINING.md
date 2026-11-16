@@ -1,11 +1,16 @@
 # Stage 3: matched dense A and adaptive spline C
 
+> Historical research notes. Earlier commands, gates, and parameter counts
+> describe previous stages. Use the [experiment README](../README.md)
+> for the maintained preparation and training workflow.
+
+
 Implementation is prepared; **full MOTUS real-data learning and GPU reload
 generation have not run**. This host has CPU-only PyTorch and no real episodes,
 model assets, verified physical clocks, SAPIEN, or authorized GPU budget. Nothing
 was submitted to Slurm. The full pilot is explicitly blocked in the entry point.
-Stages [1](data/robotwin2/ADAPTIVE_SPLINE.md) and
-[2](data/robotwin2/LOCAL_SPLINE.md) remain historical results, not replay evidence.
+Stages [1](ADAPTIVE_SPLINE.md) and
+[2](LOCAL_SPLINE.md) remain historical results, not replay evidence.
 The adaptive fitter, 36-row representation, affine knot encoding and strict shared
 decoder are unchanged.
 
@@ -76,29 +81,33 @@ not proof of full VAE receptive-field behavior or pilot readiness.
 ## Adapters and optimizer audit
 
 There was no LoRA implementation in the active MOTUS training path. The small
-`utils/research.py` utility adds registered linear LoRA modules, not another
-trainer. Compatible base weights are loaded **before** insertion and then frozen.
+`experiments/ac_spline_pilot/research.py` utility adds registered linear LoRA modules. The experiment factory and
+trainer subclass in `experiments/ac_spline_pilot/trainer.py` reuse the shared
+training loop. Compatible base weights are loaded **before** insertion and then frozen.
 Any unexpected missing/shape-incompatible frozen base tensor is an error. A/C
 both reset and fully train the complete action input MLP and output projection;
-state encoders remain loaded/frozen. Name-seeded reset keeps compatible hidden
+state encoder base weights remain loaded/frozen and receive LoRA adapters. Name-seeded reset keeps compatible hidden
 projection initialization matched despite different boundary widths.
 
-Matched scope, rank 16 / alpha 32 / dropout 0:
+Matched scope, rank 64 / alpha 128 / dropout 0:
+`target_modules: ["video_model.wan_model.*", "action_expert.*"]`.
+Only WAN and Action linears receive LoRA adapters. VLM and Understanding remain
+fully frozen. Raw tensor QKV and non-linear base parameters stay frozen; complete
+action input/output projections retain their existing full tuning.
 
-* WAN block self-attention q/k/v/o and FFN linears 0/2.
-* Action block `wan_action_o` and FFN linears 0/2.
-* Understanding block `wan_und_o` and FFN linears 0/2 **except the last block**.
+Startup verifies every trainable occurs in the optimizer exactly once.
+`trainables.json` records exact names, shapes and counts; gradient reports record
+finite norms and any unused trainables. Initial A-side gradients can be zero
+because B starts at zero.
 
-The terminal understanding outputs are discarded after final joint attention,
-so their O/FFN cannot influence video/action losses. Adapting them would create
-unused trainables. Raw tensor QKV projections, VLM, VAE, time/modulation/state
-parameters and all other base weights remain frozen in both configurations.
-
-Startup verifies that every trainable parameter occurs in the optimizer exactly
-once and no frozen parameter occurs there. `trainables.json` records exact names,
-shapes and counts for the actual checkpoint. `gradients_step_{0,1,2}.json` records
-finite gradient norms; a missing gradient path on step 2 is a hard error. Zero
-initial A-side LoRA gradients at the first step are expected because B starts zero.
+Both variants require exactly 50 complete clean `place_can_basket` episodes in
+`MOTUS_DATASET_ROOT/clean/place_can_basket`, with matching PT commands, videos,
+T5 embeddings and metadata. The converter's seed-0 permutation of sorted resolved
+paths reserves five episodes for validation and the other 45 for training.
+Normalization and knot scaling must match those 45 sources exactly. The manifest
+must cover all 45/5 episodes and may contain multiple windows per episode.
+Missing episodes, alternate tasks, randomized assets or cross-split windows are
+rejected before model construction. The launcher uses `--report_to none`.
 
 The trainer now calls the wrapped model's forward method, uses Accelerator
 accumulation, clips/advances the scheduler only at optimizer updates, and counts
@@ -109,8 +118,8 @@ The existing custom linear scheduler is explicitly registered for checkpointing.
 
 Pilot defaults are recorded as lr=1e-4, effective batch 16, 1000 updates, seed 0.
 **Diagnostic overrides:** 100 updates, batch 1 / accumulation 1 (effective 1),
-10 warmup steps, 100-step decay, four fixed training windows maximum, and four
-generation seeds [0,1,2,3]. Adapter scope/rank, loss weights, clipping and optimizer
+10 warmup steps, 100-step decay, all 45 training episodes, a four-window
+generation preview maximum, and four generation seeds [0,1,2,3]. Adapter scope/rank, loss weights, clipping and optimizer
 settings match A/C. These settings are not evidence of convergence.
 
 ## Checkpoints and generation
@@ -128,7 +137,7 @@ membership, and copies every saved trainable. Changing representation,
 normalization, time scaling or base rejects the bundle. Base task exposure is
 still unknown until the chosen checkpoint's provenance is supplied.
 
-`train/research_diagnostic.py` contains evaluation only; training stays in
+`experiments/ac_spline_pilot/diagnostic.py` contains evaluation only; training stays in
 `UniDiffuserTrainer.train`. It selects fixed dataset indices and fixed language
 indices rather than a shuffled first batch. Existing `inference_sample` no longer
 even reads `video_frames`; generation receives only current image, raw state,
@@ -178,7 +187,7 @@ Reports are retained under `outputs/stage3-components/` (test output prints the
 unique directories). Run locally from Motus:
 
 ```bash
-python train/test_research.py -v
+python experiments/ac_spline_pilot/tests/test_research.py -v
 python -m unittest discover -s data/robotwin2 -p test_adaptive_spline.py -v
 ```
 
@@ -188,15 +197,16 @@ Use an existing complete MOTUS environment (including repository requirements,
 SciPy >=1.15 for `generate_knots`, decord and CUDA PyTorch). No job or allocation
 has been requested. No use is made of the repository's placeholder 8-GPU/1.5-TB
 launch template. `run_tiny_research.sh` is a thin wrapper around the **same**
-trainer, then a second invocation of that trainer for reload-only evaluation;
+experiment entry point, then a second invocation for reload-only evaluation;
 it never invokes sbatch and checks it is on allocated compute. GPU model
 execution rejects login-node environments, DeepSpeed, multiple processes and
 full-pilot phases until their corresponding remote validation exists.
 
 First supply training-only normalization and time statistics from stages 1/2,
-compatible existing model weights, and a tiny fixed real-window manifest. The
-manifest uses absolute artifact paths and at least one separate validation
-episode/window. Example structure (replace paths with existing files):
+compatible existing model weights, and a complete clean-50 fixed-window manifest.
+It must cover all 45 training and all 5 validation episodes from the seed-0 split.
+The abbreviated example below illustrates entry fields only; a two-entry manifest
+is rejected. Replace paths and add entries for every selected episode:
 
 ```json
 {
@@ -220,13 +230,14 @@ episode/window. Example structure (replace paths with existing files):
 
 `/data`, `/sidecars` and `/replay` above are schema examples, not verified cluster
 locations. The dataset root must also contain the original `metas/<id>.txt` files.
-Validation episode membership must match the normalization's fixed split.
+Both training and validation membership must match the canonical 45/5 split.
+Exactly 50 PT episodes must be present; larger randomized corpora are rejected.
 
 In the existing environment, from the actual Motus root, set these to real
 existing paths; their values are shared by A and C:
 
 ```bash
-export MOTUS_WINDOWS=/absolute/path/tiny-real-windows.json
+export MOTUS_WINDOWS=/absolute/path/clean-50-real-windows.json
 export MOTUS_NORMALIZATION=/absolute/path/training-action-normalization.json
 export MOTUS_KNOT_SCALING=/absolute/path/training-knot-scaling.json
 export MOTUS_DATASET_ROOT=/absolute/path/preprocess/robotwin2
@@ -242,13 +253,14 @@ submit a new job):
 
 ```bash
 export MOTUS_DIAGNOSTIC_OUTPUT="$PWD/outputs/tiny-A-unique-run"
-srun --jobid="$SLURM_JOB_ID" --nodes=1 --ntasks=1 --gpus=1 --cpus-per-task=4 bash scripts/slurm/run_tiny_research.sh A
+srun --jobid="$SLURM_JOB_ID" --nodes=1 --ntasks=1 --gpus=1 --cpus-per-task=4 bash experiments/ac_spline_pilot/scripts/run_tiny_research.sh A
 
 export MOTUS_DIAGNOSTIC_OUTPUT="$PWD/outputs/tiny-C-unique-run"
-srun --jobid="$SLURM_JOB_ID" --nodes=1 --ntasks=1 --gpus=1 --cpus-per-task=4 bash scripts/slurm/run_tiny_research.sh C
+srun --jobid="$SLURM_JOB_ID" --nodes=1 --ntasks=1 --gpus=1 --cpus-per-task=4 bash experiments/ac_spline_pilot/scripts/run_tiny_research.sh C
 ```
 
-Each variant performs 100 updates and 4-seed generation on at most four windows,
+Each variant performs 100 updates over all 45 training episodes and 4-seed
+generation previews on at most four windows,
 then launches a fresh Python reload/generation process. Required GPU memory and
 wall time have not been measured; the approved allocation must cover the run.
 Never execute the Python training command on a login node. Fresh output paths

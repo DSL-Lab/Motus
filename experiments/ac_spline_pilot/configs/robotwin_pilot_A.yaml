@@ -1,0 +1,18 @@
+# Full 1,000-update dense pilot. Rank-64 WAN/Action LoRA and clean 45/5 split
+# are inherited from the matched diagnostic configuration.
+base_config: robotwin_research_A.yaml
+research:
+  phase: pilot
+training:
+  max_steps: 1000
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  warmup_steps: 200
+  cycle_length: 1000
+system:
+  save_interval: 250
+  val_interval: 1000
+  checkpoint_dir: outputs/ac-pilot
+logging:
+  report_to: none
+  run_name: pilot-seed-0

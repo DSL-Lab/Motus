@@ -16,7 +16,7 @@ def generate_diagnostic(model, dataloader, config, output, reference_checkpoint=
     from robotwin_spline import CHANNELS
     from data.robotwin2.adaptive_spline import decode_local
     from data.robotwin2.spline_diagnostics import score_spline_prediction
-    from sample import inference_sample
+    from train.sample import inference_sample
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt

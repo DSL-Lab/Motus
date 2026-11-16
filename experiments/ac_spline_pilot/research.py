@@ -3,17 +3,18 @@ import dataclasses
 import hashlib
 import json
 from pathlib import Path
-import re
+from fnmatch import fnmatchcase
 
 import torch
 from torch import nn
 
 SCHEMA = "motus-adaptive-research-v1"
+DEFAULT_TARGET_MODULES = ("video_model.wan_model.*", "action_expert.*")
 PROJECTIONS = ("input_encoder.action_encoder.", "decoder.action_head.")
 
 
 class LoRALinear(nn.Module):
-    def __init__(self, base, rank=16, alpha=32., dropout=0.):
+    def __init__(self, base, rank=64, alpha=128., dropout=0.):
         super().__init__()
         self.base = base
         self.base.requires_grad_(False)
@@ -23,21 +24,36 @@ class LoRALinear(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(base.out_features, rank, device=base.weight.device, dtype=torch.float32))
         nn.init.kaiming_uniform_(self.lora_A, a=5**.5)
 
+    @property
+    def weight(self):
+        return self.base.weight
+
+    @property
+    def bias(self):
+        return self.base.bias
+
+    @property
+    def in_features(self):
+        return self.base.in_features
+
+    @property
+    def out_features(self):
+        return self.base.out_features
+
     def forward(self, x):
-        base = self.base(x)
+        base = self.base(x.to(self.base.weight.dtype))
         update = torch.nn.functional.linear(torch.nn.functional.linear(self.dropout(x.float()), self.lora_A), self.lora_B)
         return base + (update * self.multiplier).to(base.dtype)
 
 
-def adapter_target(name):
-    return bool(re.fullmatch(
-        r"video_model\.wan_model\.blocks\.\d+\.(self_attn\.(q|k|v|o)|ffn\.(0|2))"
-        r"|action_expert\.blocks\.\d+\.(wan_action_o|ffn\.(0|2))"
-        r"|und_expert\.blocks\.\d+\.(wan_und_o|ffn\.(0|2))", name))
-
-
 def configure_adapters(model, settings, seed=0):
-    """Freeze every base, adapt explicit linear scope, fully tune action I/O."""
+    """Adapt selected branches; retain the matched full action I/O tuning."""
+    settings = dict(settings)
+    target_modules = settings.pop('target_modules', DEFAULT_TARGET_MODULES)
+    if isinstance(target_modules, str):
+        target_modules = [target_modules]
+    if not target_modules:
+        raise ValueError('LoRA target_modules must contain at least one pattern')
     model.requires_grad_(False)
     # Name-seeded projection reset makes hidden projection initialization match
     # across A/C despite the different boundary widths consuming different RNG.
@@ -50,17 +66,16 @@ def configure_adapters(model, settings, seed=0):
                 nn.init.zeros_(module.bias)
             if 'decoder.action_head' in name:
                 nn.init.zeros_(module.weight)
-    last_und = len(model.und_expert.blocks) - 1
-    # The terminal understanding output is discarded after the last joint
-    # attention. Its O/FFN cannot reach either loss; do not optimize dead adapters.
-    inactive_prefix = f'und_expert.blocks.{last_und}.'
+    # Snapshot before replacement so newly added adapter linears are not revisited.
     targets = [(name, module) for name, module in model.named_modules()
-               if isinstance(module, nn.Linear) and adapter_target(name) and not name.startswith(inactive_prefix)]
+               if isinstance(module, nn.Linear)
+               and any(fnmatchcase(name, pattern) for pattern in target_modules)]
     if not targets:
-        raise ValueError("No verified LoRA targets found")
+        raise ValueError("No linear layers match LoRA target_modules")
     for name, module in targets:
-        parent_name, child = name.rsplit(".", 1)
-        setattr(model.get_submodule(parent_name), child, LoRALinear(module, **settings))
+        parent_name, _, child = name.rpartition('.')
+        parent = model.get_submodule(parent_name) if parent_name else model
+        setattr(parent, child, LoRALinear(module, **settings))
     model.action_expert.input_encoder.action_encoder.requires_grad_(True)
     model.action_expert.decoder.action_head.requires_grad_(True)
     # Keep trainable projections in FP32 even when frozen backbone uses BF16.
@@ -130,10 +145,9 @@ def load_contract(config):
     if scaling["scope"] != "training-only" or scaling["normalization_identity"] != normalization["identity"]:
         raise ValueError("Research training requires matching training-only knot scaling")
     windows = json.loads(Path(research['window_manifest']).read_text())
-    count = sum(w['split'] == 'train' for w in windows['windows'])
-    if not 1 <= count <= research['diagnostic']['windows']:
-        raise ValueError('Tiny diagnostic requires one to four fixed real training windows')
-    contract = dict(schema=SCHEMA, representation=representation, normalization=normalization, knot_scaling=scaling,
+    from .data import validate_dataset_split
+    dataset_split = validate_dataset_split(config, normalization, scaling, windows)
+    contract = dict(schema=SCHEMA, representation=representation, dataset_split=dataset_split, normalization=normalization, knot_scaling=scaling,
                     channels=CHANNELS, channel_units=['radian']*6 + ['continuous_open_fraction'] + ['radian']*6 + ['continuous_open_fraction'],
                     degree=3, knot_encoding='observation-relative absolute position', time_units='source_action_step',
                     executed_prefix=dict(source_stride=3, command_count=16, seconds_mapping='requires verified controller clock'),
@@ -172,18 +186,3 @@ def load_research_bundle(model, directory):
                 raise ValueError(f"Checkpoint projection shape mismatch: {name}")
             params[name].copy_(value)
     return metadata
-
-
-def masked_video_loss(prediction, target, latent_valid):
-    if latent_valid.shape != (prediction.shape[0], prediction.shape[2]):
-        raise ValueError("VAE latent validity shape mismatch")
-    keep = latent_valid.clone().bool()
-    keep[:, 0] = False
-    mask = keep[:, None, :, None, None].expand_as(prediction)
-    if not keep[:, 1:].any(dim=1).all():
-        raise ValueError("A sample has no unpadded future video latent")
-    error = (prediction.float() - target.float()).square()
-    valid_mean = ((error * mask).flatten(1).sum(1) / mask.flatten(1).sum(1)).mean()
-    # Retain the original dense loss scale, which averages over the current
-    # (zero-loss) latent as well as future latents. No 1.5x video-weight shift.
-    return valid_mean * (prediction.shape[2] - 1) / prediction.shape[2]
