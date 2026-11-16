@@ -15,6 +15,7 @@ def generate_diagnostic(model, dataloader, config, output, reference_checkpoint=
     from data.dataset import collate_fn
     from robotwin_spline import CHANNELS
     from data.robotwin2.adaptive_spline import decode_local
+    from data.robotwin2.spline_diagnostics import score_spline_prediction
     from sample import inference_sample
     import matplotlib
     matplotlib.use('Agg')
@@ -63,15 +64,12 @@ def generate_diagnostic(model, dataloader, config, output, reference_checkpoint=
             commands = np.full((len(times), 14), np.nan)
             try:
                 if contract['representation'] == 'spline':
-                    knots = parameters[:, 0].astype(float) * contract['knot_scaling']['scale'] + contract['knot_scaling']['offset']
-                    record['raw_knots_finite'] = bool(np.isfinite(knots).all())
-                    record['raw_knots_monotone'] = bool(np.all(np.diff(knots) >= 0))
-                    record['raw_domain_valid'] = bool(np.isfinite(knots).all() and knots[3] < knots[-4] and knots[3] <= 0 <= knots[-4])
-                    record['raw_domain_relative'] = [float(knots[3]), float(knots[-4])] if np.isfinite(knots).all() else None
-                    # Test the complete original command prefix first. Do not
-                    # sort, repair knots, replace invalid predictions or retime.
-                    commands, report = decode_local(parameters, times, obs, contract['knot_scaling'], contract['normalization'])
-                    record['decoder_report'] = report
+                    commands, validity = score_spline_prediction(
+                        parameters, times, obs, contract['knot_scaling'],
+                        contract['normalization'], target_commands)
+                    record.update(validity)
+                    if not record['full_prefix_valid']:
+                        raise ValueError(record['invalid_reason'])
                 else:
                     if not np.isfinite(parameters).all():
                         raise ValueError('Nonfinite dense predictions')
@@ -99,6 +97,7 @@ def generate_diagnostic(model, dataloader, config, output, reference_checkpoint=
     report = dict(contract_identity=contract['identity'], model='full MOTUS', real_windows=count,
                   representation=contract['representation'], seeds=seeds, records=records,
                   valid_fraction=float(np.mean([r['full_prefix_valid'] for r in records])),
+                  raw_valid_fraction=float(np.mean([r.get('raw_full_prefix_valid', r['full_prefix_valid']) for r in records])),
                   target_rows=model.config.action_chunk_size,
                   action_branch_tokens=model.config.action_chunk_size + 1 + model.action_expert.config.num_registers,
                   reload_check='not_requested')

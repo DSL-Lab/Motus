@@ -181,7 +181,7 @@ class LocalTargetChecks(unittest.TestCase):
         bad = sample["parameters"].copy()
         bad[5, 0] = bad[4, 0] - 1
         with self.assertRaisesRegex(ValueError, "decreasing"):
-            decode_local(bad, [0.], 0., self.scaling, self.norm)
+            decode_local(bad, [0.], 0., self.scaling, self.norm, repair_knots=False)
         bad = sample["parameters"].copy()
         bad[1, 2] = np.nan
         with self.assertRaisesRegex(ValueError, "finite"):

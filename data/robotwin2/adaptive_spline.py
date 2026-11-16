@@ -63,31 +63,58 @@ def extract_local(spline, observation_time, scaling):
                 knot_encoding="observation-relative absolute position; (time-offset)/scale")
 
 
-def decode_local(parameters, timestamps, observation_time, scaling, normalization):
-    """MOTUS deployment adapter. Timestamps are absolute source-row times.
+def prepare_local(parameters, scaling, *, repair_knots=True):
+    """Invert absolute knot scaling and apply Appendix D decoding safeguards.
 
-    Reject inversions and unsupported coverage; never sort or extrapolate.
-    Return applied structural trimming and raw continuous gripper range events.
+    Running maximum preserves row order. Removing a leading surplus endpoint
+    knot removes the leading inactive coefficient; trailing trimming removes
+    trailing inactive coefficients. Interior multiplicities remain unchanged
+    and are checked by the shared strict evaluator.
     """
     offset, scale = validate_time_scaling(scaling)
     a = np.asarray(parameters, dtype=np.float64)
     if a.shape != (36, 15) or not np.isfinite(a).all():
         raise ValueError("Invalid packed parameters: expected finite (36,15)")
     with np.errstate(over="ignore", invalid="ignore"):
-        u = a[:, 0] * scale + offset
-    if not np.isfinite(u).all():
+        raw = a[:, 0] * scale + offset
+    if not np.isfinite(raw).all():
         raise ValueError("Nonfinite knots after inverse scaling")
-    if np.any(np.diff(u) < 0):
+    if not repair_knots and np.any(np.diff(raw) < 0):
         raise ValueError("Invalid knots: decreasing times; repair is disabled")
-    n = len(u)
-    # Explicit reference endpoint-padding rule: trim excess repeats at the right
-    # only, along with the now-inactive coefficient rows. No arbitrary repair.
-    while n > 8 and u[n - 5] == u[n - 1]:
-        n -= 1
-    u, cp = u[:n], a[:n - 4, 1:]
+    u = np.maximum.accumulate(raw) if repair_knots else raw.copy()
+    delta = u - raw
+    start, end = 0, len(u)
+    # Cubic endpoints admit four repetitions. Keep len(u) == len(cp) + 4
+    # and the original coefficient association after either boundary trim.
+    while end - start > 8 and u[start] == u[start + 4]:
+        start += 1
+    while end - start > 8 and u[end - 5] == u[end - 1]:
+        end -= 1
+    knots, cp = u[start:end], a[start:end - 4, 1:]
+    report = dict(repaired_knots=bool(np.any(delta)),
+        repaired_knot_count=int(np.count_nonzero(delta)),
+        knot_repair_max_source_steps=float(delta.max()),
+        knot_repair_mean_source_steps=float(delta.mean()),
+        knot_repair_max_normalized=float(delta.max() / scale),
+        raw_knots_finite=True, raw_knots_monotone=bool(np.all(np.diff(raw) >= 0)),
+        raw_domain_relative=[float(raw[3]), float(raw[-4])],
+        valid_interval_relative=[float(knots[3]), float(knots[-4])],
+        trimmed_head_knots=start, trimmed_tail_knots=36 - end,
+        decoding_policy="absolute knots; running maximum; trim surplus endpoints; no extrapolation")
+    return knots, cp, report
+
+
+def decode_local(parameters, timestamps, observation_time, scaling, normalization, *, repair_knots=True):
+    """Shared offline/deployment decoder at absolute source-row timestamps.
+
+    Repair inversions with running maximum (Appendix D). Reject nonfinite
+    values, invalid interior multiplicities and unsupported execution coverage.
+    ``repair_knots=False`` measures raw prediction validity only.
+    """
+    u, cp, safeguards = prepare_local(parameters, scaling, repair_knots=repair_knots)
     commands, report = evaluate_local(u, cp, timestamps, observation_time,
-                                      normalization, boundary_scale=scale)
-    return commands, dict(report, trimmed_tail_knots=36 - n,
+                                      normalization, boundary_scale=float(scaling["scale"]))
+    return commands, dict(report, **safeguards,
         gripper_out_of_range_count=int(np.count_nonzero((commands[:, [6, 13]] < 0) | (commands[:, [6, 13]] > 1))),
         gripper_policy="continuous unchanged; simulator retains its existing saturation")
 

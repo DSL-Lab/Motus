@@ -50,13 +50,23 @@ supervised under the reference convention; validity metadata is not an action
 loss mask. In a short tail, fewer than 32 coefficients are effective.
 
 `decode_local(parameters, original_timestamp_grid_in_source_steps, observation,
-scaling, normalization)` is the sole deployment decoder. It inverts the affine
-time map; checks shape, finiteness, monotonicity, multiplicity, domain and requested
-coverage; discards the four structural coefficient rows; and removes surplus
-right-end knot repetitions together with the corresponding inactive coefficient
-rows. This trimming is explicitly reported. No running-maximum repair or sorting
-is performed (a deliberate strict alternative to the paper's prediction repair).
-Interior inversions and unsupported domains are errors.
+scaling, normalization)` is the shared offline/deployment adapter. It inverts the
+affine absolute-time map and applies Appendix D's running maximum without
+reordering rows or coefficients. It trims surplus endpoint repetitions at either
+end, keeping the corresponding coefficient slice (`start:end-4`) so the cubic
+relationship remains `len(knots) == len(coefficients) + 4`. It then calls the
+existing strict `robotwin_spline.local.evaluate_local` evaluator on the fully
+supported domain `[knots[3], knots[-4]]`. Nonfinite values, interior multiplicity
+above four, degenerate domains and insufficient requested-prefix coverage remain
+errors. `repair_knots=False` is available for raw-validity diagnostics only;
+default inference and offline scoring both enable repair. Reports include repair
+count/magnitude in source-step units and both endpoint trim counts.
+
+The legacy dense `inference/robotwin/Motus/deploy_policy.py` wrapper does not load
+research adapter bundles or decode spline predictions. Method C's stored decoder
+contract resolves to this shared adapter; no separate deployed spline repair is
+maintained. This fix does not add a research checkpoint deployment loader or
+claim a simulator rollout.
 
 Only floating-point boundary snaps within a recorded float32 roundoff allowance
 are permitted, and their count is returned. Evaluation never extrapolates or
