@@ -132,7 +132,8 @@ class ComponentTests(unittest.TestCase):
         torch.testing.assert_close(state, batch['initial_state'])
 
     def test_existing_loader_and_collate_keep_current_conditioning_identical(self):
-        from data.robotwin2.adaptive_spline import fit_episode, normalize, extract_local, select_future_frames
+        from robotwin_spline import fit_episode, normalize
+        from data.robotwin2.adaptive_spline import extract_local, select_future_frames
         directory = fixture_directory()
         t = np.linspace(0, 1, 120)
         actions = np.column_stack([np.sin((j+1)*t)*.3 for j in range(14)]).astype(np.float32).astype(np.float64)

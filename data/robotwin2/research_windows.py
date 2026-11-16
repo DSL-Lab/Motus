@@ -5,7 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .adaptive_spline import (extract_local, read_cache, decode_local, select_future_frames, identity)
+from robotwin_spline import read_cache, identity, normalize, decode
+from .adaptive_spline import extract_local, decode_local, select_future_frames
 
 
 def load_windows(path, val, contract):
@@ -28,7 +29,6 @@ def load_windows(path, val, contract):
             raise ValueError("Failed fit or inconsistent training normalization")
         if hashlib.sha256(actions.tobytes()).hexdigest() != meta['source']['action_sha256']:
             raise ValueError('Cached commands do not match their source identity')
-        from .adaptive_spline import normalize
         tolerance = meta['diagnostics']['settings']['tolerance']
         if tolerance > .01 or np.abs(spline(np.arange(len(actions))) - normalize(actions, expected)).max() > tolerance:
             raise ValueError('Stage-1 reconstruction check failed on this episode')
@@ -50,7 +50,6 @@ def load_windows(path, val, contract):
         # reach training. The original command grid remains stride three.
         dense_indices = np.minimum(obs + 3 * np.arange(1, 17), len(actions) - 1)
         target_decoded, _ = decode_local(packet["parameters"], dense_indices, obs, contract["knot_scaling"], expected)
-        from .adaptive_spline import decode
         if not np.allclose(target_decoded, decode(spline(dense_indices), expected), atol=2e-5, rtol=0):
             raise ValueError("Local/global packed-target round trip failed")
         selection = select_future_frames(packet, timeline["action_times"], timeline["camera_times"])

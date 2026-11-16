@@ -1,168 +1,14 @@
-"""Episode-level cubic fitting; no model, simulator, or image dependencies.
+"""MOTUS 36-row targets, time scaling, video selection and deployment adapter.
 
-Insertion follows bspline-policy/common/bspline_action.py: SciPy generate_knots
-(FITPACK residual-region insertion), followed by explicit-knot QR least squares.
-Unlike the reference wrapper, exhausted/capped fits remain failed fits.
+Shared episode math and sidecars live in the installed robotwin_spline package.
+Import generic utilities from robotwin_spline directly.
+See RESEARCH_TRAINING.md for setup.
 """
-from __future__ import annotations
-
-import hashlib
-import json
-from pathlib import Path
-
 import numpy as np
-import scipy
-from scipy.interpolate import BSpline, generate_knots, make_lsq_spline
+from robotwin_spline import identity, read_cache
+from robotwin_spline.local import extract_segment, evaluate_local
 
-VERSION = "robotwin-episode-cubic-v1"
-CHANNELS = [f"left_joint_{i}" for i in range(1, 7)] + ["left_gripper"] + [
-    f"right_joint_{i}" for i in range(1, 7)
-] + ["right_gripper"]
-
-
-def identity(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
-
-
-def load_actions(path):
-    """Read precisely the original MOTUS target, without touching images."""
-    path = Path(path).resolve(strict=True)
-    if path.suffix in (".hdf5", ".h5"):
-        import h5py
-        with h5py.File(path, "r") as f:
-            actions = f["joint_action/vector"][()]
-    elif path.suffix == ".pt":
-        import torch
-        actions = torch.load(path, map_location="cpu", weights_only=True).numpy()
-    elif path.suffix == ".npy":
-        # Explicit action-only interchange / synthetic test input.
-        actions = np.load(path, allow_pickle=False)
-    else:
-        raise ValueError(f"Unsupported episode format: {path}")
-    if path.suffix != ".npy":
-        # Original raw converter and training loader both cast commands to float32.
-        actions = np.asarray(actions, dtype=np.float32)
-    actions = np.asarray(actions, dtype=np.float64)
-    if actions.ndim != 2 or actions.shape[1] != 14 or len(actions) < 4:
-        raise ValueError(f"Expected finite (T>=4,14) commanded actions: {actions.shape}")
-    if not np.isfinite(actions).all():
-        raise ValueError("Nonfinite source actions")
-    return actions
-
-
-def source_identity(path, actions):
-    path = Path(path).resolve()
-    stat = path.stat()
-    return dict(path=str(path), bytes=stat.st_size, mtime_ns=stat.st_mtime_ns,
-                action_sha256=hashlib.sha256(actions.tobytes()).hexdigest())
-
-
-def normalize(actions, norm):
-    low, high = np.array(norm["low"]), np.array(norm["high"])
-    width = high - low
-    y = 2 * (actions - low) / np.where(width == 0, 1, width) - 1
-    # A training-constant channel cannot encode an outlier by mapping it to zero.
-    if np.any(actions[:, width == 0] != low[width == 0]):
-        raise ValueError("Episode differs from a training-constant channel; normalization cannot represent it")
-    y[:, width == 0] = 0
-    return y
-
-
-def decode(y, norm):
-    low, high = np.array(norm["low"]), np.array(norm["high"])
-    return (y + 1) * (high - low) / 2 + low
-
-
-def fit_episode(y, tolerance=0.01, max_control_points=None, smoothing=1e-12):
-    y = np.asarray(y, dtype=np.float64)
-    if y.ndim != 2 or len(y) < 4 or not np.isfinite(y).all():
-        raise ValueError("Need at least four finite multichannel samples")
-    if not np.isfinite(tolerance) or tolerance <= 0 or not np.isfinite(smoothing) or smoothing <= 0:
-        raise ValueError("Tolerance and generator smoothing must be finite and positive")
-    cap = min(len(y), max_control_points if max_control_points is not None else len(y))
-    if cap < 4:
-        raise ValueError("Control point cap must be >=4")
-    x = np.arange(len(y), dtype=float)
-    history, spline = [], None
-    reason = "generator_exhausted"
-    try:
-        for knots in generate_knots(x, y, k=3, s=smoothing):
-            kcount = len(knots) - 4
-            if kcount > cap:
-                reason = "control_point_cap"
-                break
-            if (np.any(np.diff(knots) < 0) or not np.all(knots[:4] == 0)
-                    or not np.all(knots[-4:] == x[-1])):
-                reason = "invalid_generated_knots"
-                break
-            # Ordered positive basis supports supply a Schoenberg-Whitney
-            # matching, checking full column rank without a dense T-by-K SVD.
-            basis = BSpline.design_matrix(x, knots, 3).tocsc()
-            last_row = -1
-            for column in range(kcount):
-                start, stop = basis.indptr[column:column + 2]
-                rows = basis.indices[start:stop]
-                eligible = rows[(basis.data[start:stop] > 0) & (rows > last_row)]
-                if not len(eligible):
-                    raise ValueError("Generated knots violate independent positive support conditions")
-                last_row = int(eligible[0])
-            candidate = make_lsq_spline(x, y, knots, k=3, method="qr")
-            candidate.extrapolate = False
-            if not np.isfinite(candidate.c).all():
-                reason = "nonfinite_coefficients"
-                break
-            spline = candidate
-            error = float(np.abs(spline(x) - y).max())
-            history.append(dict(control_points=kcount, max_abs_normalized_residual=error))
-            if error <= tolerance:
-                reason = "tolerance_met"
-                break
-    except (ValueError, np.linalg.LinAlgError) as exc:
-        reason = f"solver_failure: {exc}"
-    if spline is None:
-        raise ValueError(f"No admissible initial fit: {reason}")
-    residual = spline(x) - y
-    return spline, dict(success=reason == "tolerance_met", reason=reason,
-        max_abs_normalized_residual=float(np.abs(residual).max()),
-        per_channel_max_abs_normalized_residual=np.abs(residual).max(axis=0).tolist(),
-        per_channel_rmse_normalized=np.sqrt(np.mean(residual**2, axis=0)).tolist(),
-        history=history, settings=dict(degree=3, tolerance=tolerance,
-        max_control_points=cap, generator_s=smoothing, solver="make_lsq_spline/qr",
-        insertion="scipy.generate_knots/FITPACK", scipy_version=scipy.__version__,
-        endpoint_values_constrained=False))
-
-
-def range_diagnostics(spline, actions, norm):
-    """Exact per-channel cubic extrema, including between recorded samples."""
-    from scipy.interpolate import PPoly
-    extrema = []
-    for j in range(actions.shape[1]):
-        pp = PPoly.from_spline((spline.t, spline.c[:, j], spline.k))
-        roots = pp.derivative().roots(extrapolate=False)
-        roots = roots[np.isfinite(roots) & (roots >= 0) & (roots <= len(actions) - 1)]
-        times = np.r_[0., len(actions) - 1., roots, np.unique(spline.t)]
-        values = decode(spline(times), norm)[:, j]
-        extrema.append([float(values.min()), float(values.max())])
-    ranges = np.array(extrema)
-    low, high = actions.min(axis=0), actions.max(axis=0)
-    return dict(demonstrated_min=low.tolist(), demonstrated_max=high.tolist(),
-                decoded_curve_min=ranges[:, 0].tolist(), decoded_curve_max=ranges[:, 1].tolist(),
-                overshoot_below=np.maximum(low - ranges[:, 0], 0).tolist(),
-                overshoot_above=np.maximum(ranges[:, 1] - high, 0).tolist())
-
-
-def read_cache(path):
-    with np.load(path, allow_pickle=False) as f:
-        metadata = json.loads(str(f["metadata"]))
-        actions = f["actions"].copy()
-        spline = BSpline(f["knots"].copy(), f["control_points"].copy(), int(f["degree"]), extrapolate=False)
-    return actions, spline, metadata
-
-
-# Stage 2 contract. Scaling concerns knot times only; coefficient columns stay
-# in the stage-1 normalized action coordinates, including continuous grippers.
 LOCAL_SCHEMA = "motus-local-cubic-36-v1"
-
 
 def validate_time_scaling(scaling):
     if scaling.get("scope") not in ("training-only", "diagnostic-only"):
@@ -192,11 +38,9 @@ def extract_local(spline, observation_time, scaling):
     obs = float(observation_time)
     if degree != 3 or c.ndim != 2 or c.shape[1] != 14 or len(c) != len(t) - 4:
         raise ValueError("Expected canonical unpadded cubic episode spline with 14 channels")
-    if not np.isfinite(obs) or not t[3] <= obs <= t[-4]:
-        raise ValueError("Observation outside episode spline domain")
-    span = min(max(int(np.searchsorted(t, obs, side="right") - 1), 3), len(c) - 1)
-    start = span - 3
-    raw_knots = t[start:start + 36]
+    segment = extract_segment(spline, obs, knot_count=36)
+    span, start = segment["span"], segment["global_start"]
+    raw_knots = segment["knots"]
     n = len(raw_knots)
     active = n - 4
     if active < 4:
@@ -220,7 +64,7 @@ def extract_local(spline, observation_time, scaling):
 
 
 def decode_local(parameters, timestamps, observation_time, scaling, normalization):
-    """The shared deployment decoder. Timestamps are absolute source-row times.
+    """MOTUS deployment adapter. Timestamps are absolute source-row times.
 
     Reject inversions and unsupported coverage; never sort or extrapolate.
     Return applied structural trimming and raw continuous gripper range events.
@@ -241,34 +85,11 @@ def decode_local(parameters, timestamps, observation_time, scaling, normalizatio
     while n > 8 and u[n - 5] == u[n - 1]:
         n -= 1
     u, cp = u[:n], a[:n - 4, 1:]
-    _, counts = np.unique(u, return_counts=True)
-    if np.any(counts > 4) or u[3] >= u[-4]:
-        raise ValueError("Invalid knot multiplicity or degenerate decoding domain")
-    if not np.isfinite(observation_time):
-        raise ValueError("Nonfinite observation time")
-    times = np.asarray(timestamps, dtype=np.float64)
-    if times.ndim != 1 or not len(times) or not np.isfinite(times).all() or np.any(np.diff(times) < 0):
-        raise ValueError("Controller timestamps must be finite ordered 1D values")
-    relative = times - observation_time
-    # Float32 packing changes knot coordinates slightly. Do not extrapolate:
-    # permit only machine-roundoff boundary snaps and report every such snap.
-    atol = 4 * np.finfo(np.float32).eps * max(1., np.max(np.abs(u)), scale)
-    if relative.min() < u[3] - atol or relative.max() > u[-4] + atol:
-        raise ValueError(f"Insufficient coverage: requested {relative[[0,-1]].tolist()}, domain {[u[3],u[-4]]}")
-    evaluated = np.clip(relative, u[3], u[-4])
-    values = BSpline(u, cp, 3, extrapolate=False)(evaluated)
-    low, high = np.asarray(normalization["low"]), np.asarray(normalization["high"])
-    if low.shape != (14,) or high.shape != (14,) or not np.isfinite([low, high]).all() or np.any(high < low):
-        raise ValueError("Invalid action normalization bounds")
-    commands = decode(values, normalization)
-    if not np.isfinite(commands).all():
-        raise ValueError("Nonfinite decoded commands")
-    return commands, dict(valid_interval_relative=[float(u[3]), float(u[-4])],
-        trimmed_tail_knots=36 - n, effective_control_points=n - 4,
-        boundary_roundoff_snaps=int(np.count_nonzero(evaluated != relative)),
+    commands, report = evaluate_local(u, cp, timestamps, observation_time,
+                                      normalization, boundary_scale=scale)
+    return commands, dict(report, trimmed_tail_knots=36 - n,
         gripper_out_of_range_count=int(np.count_nonzero((commands[:, [6, 13]] < 0) | (commands[:, [6, 13]] > 1))),
-        gripper_policy="continuous unchanged; simulator retains its existing saturation",
-        repaired_knots=False, extrapolated=False)
+        gripper_policy="continuous unchanged; simulator retains its existing saturation")
 
 
 def fit_knot_time_scaling(caches):
@@ -374,18 +195,3 @@ def select_future_frames(sample, action_times, camera_times, *, count=8, knot_of
                 mask_status="inspection-only; MOTUS currently consumes neither mask; padded samples blocked",
                 settings=dict(count=count, knot_offset=knot_offset, knot_stride=knot_stride,
                               rounding="nearest timestamp, earlier index on ties", vae_future_group=4))
-
-
-def decode_episode_grid(spline, times, scaling, normalization):
-    """Decode a whole ordered timestamp grid using only the packed decoder."""
-    times = np.asarray(times, float)
-    if times.ndim != 1 or not len(times) or not np.isfinite(times).all() or np.any(np.diff(times) < 0):
-        raise ValueError("Invalid episode decoding grid")
-    outputs, reports, sample = [], [], None
-    for time in times:
-        if sample is None or time > sample["observation_time"] + sample["valid_interval_relative"][1]:
-            sample = extract_local(spline, time, scaling)
-        result, report = decode_local(sample["parameters"], [time], sample["observation_time"], scaling, normalization)
-        outputs.append(result[0])
-        reports.append(report)
-    return np.asarray(outputs), reports

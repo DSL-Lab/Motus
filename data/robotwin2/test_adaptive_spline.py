@@ -9,9 +9,10 @@ import uuid
 import numpy as np
 from scipy.interpolate import BSpline
 
-from adaptive_spline import decode, fit_episode, normalize, read_cache, range_diagnostics
-from convert_episode_spline import main
-from adaptive_spline import (extract_local, decode_local, decode_episode_grid,
+from robotwin_spline import decode, fit_episode, normalize, read_cache, range_diagnostics
+from robotwin_spline.convert import main
+from robotwin_spline.local import decode_episode_grid
+from adaptive_spline import (extract_local, decode_local,
                             select_future_frames, fit_knot_time_scaling)
 
 
@@ -141,11 +142,11 @@ class LocalTargetChecks(unittest.TestCase):
         knots = sample["parameters"][:, 0] * self.scaling["scale"] + self.scaling["offset"]
         self.assertLess(knots[0], 0)  # retain past support, not clipped to observation
 
-    def test_whole_controller_grid_uses_same_decoder(self):
+    def test_controller_grid_uses_shared_episode_decoder(self):
         times = np.linspace(0, 179, 1200)
-        actual, reports = decode_episode_grid(self.spline, times, self.scaling, self.norm)
+        actual, reports = decode_episode_grid(self.spline, times, self.norm)
         np.testing.assert_allclose(actual, self.spline(times), atol=2e-5)
-        self.assertEqual(len(reports), len(times))
+        self.assertFalse(reports[0]['extrapolated'])
 
     def test_actual_packed_npz_serialization(self):
         sample = extract_local(self.spline, 63.4, self.scaling)
@@ -253,7 +254,7 @@ class LocalTargetChecks(unittest.TestCase):
 class ReplayHookChecks(unittest.TestCase):
     def test_existing_step_schedule_velocity_and_gripper_eps_are_retained(self):
         # A simulator-free hook contract test; this is NOT simulator replay.
-        from replay_episode_spline import run_trial
+        from robotwin_spline.replay import run_trial
         class Scene:
             def step(self):
                 pass

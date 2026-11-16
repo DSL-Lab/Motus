@@ -1,4 +1,4 @@
-"""Inspect decoded curves, residuals, shared knots and analytic range overshoot."""
+"""Inspect MOTUS packed spline targets and knot-aligned video selection."""
 import argparse
 import json
 from pathlib import Path
@@ -8,68 +8,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from adaptive_spline import decode, normalize, range_diagnostics, read_cache
-
-
-def visualize(path):
-    path = Path(path)
-    actions, spline, meta = read_cache(path)
-    x = np.arange(len(actions))
-    fine = np.linspace(0, len(actions) - 1, max(1000, len(actions) * 8))
-    norm = meta["normalization"]
-    reconstructed = decode(spline(fine), norm)
-    residual = spline(x) - normalize(actions, norm)
-    knots = np.unique(spline.t)
-    outputs = []
-    for name, channels in (("arms", list(range(6)) + list(range(7, 13))), ("grippers", [6, 13])):
-        fig, axes = plt.subplots(len(channels), 2, figsize=(15, 2.5 * len(channels)), squeeze=False)
-        for row, j in enumerate(channels):
-            left, right = axes[row]
-            left.plot(x, actions[:, j], color="black", lw=1, label="original commands")
-            left.plot(fine, reconstructed[:, j], color="tab:orange", lw=0.9, label="decoded cubic")
-            left.axhspan(actions[:, j].min(), actions[:, j].max(), alpha=0.08)
-            left.set_title(meta["channels"][j], fontsize=9)
-            left.set_ylabel("radians" if j not in (6, 13) else "0 closed / 1 open", fontsize=9)
-            right.plot(x, residual[:, j], lw=0.9)
-            tol = meta["diagnostics"]["settings"]["tolerance"]
-            right.axhline(tol, color="red", ls="--", lw=0.6)
-            right.axhline(-tol, color="red", ls="--", lw=0.6)
-            right.set_ylabel("normalized residual")
-            right.set_title(f"max |error| = {np.abs(residual[:, j]).max():.6g}", fontsize=9)
-            for ax in (left, right):
-                ax.vlines(knots, 0, 0.05, transform=ax.get_xaxis_transform(), color="tab:blue", lw=0.6)
-                ax.grid(alpha=0.15)
-        axes[0, 0].legend(fontsize=8)
-        for ax in axes[-1]:
-            ax.set_xlabel("source action-step index; blue ticks = shared knots")
-        fig.suptitle(f"{meta['task']} / {Path(meta['source']['path']).name} / {norm['scope']} / "
-                     f"{meta['diagnostics']['reason']}\nDecoded command diagnostics; simulator execution not assessed")
-        fig.tight_layout(rect=(0, 0, 1, 0.96))
-        target = path.with_suffix(f".{name}.png")
-        fig.savefig(target, dpi=120)
-        plt.close(fig)
-        outputs.append(str(target))
-    ranges = range_diagnostics(spline, actions, norm)
-    fig, ax = plt.subplots(figsize=(14, 5))
-    ax.axis("off")
-    rows = [[meta["channels"][j]] + [f"{ranges[k][j]:.6g}" for k in ranges] for j in range(14)]
-    table = ax.table(cellText=rows, colLabels=["channel", "demo min", "demo max", "curve min", "curve max", "below", "above"], loc="center")
-    table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    table.scale(1, 1.35)
-    ax.set_title("Decoded ranges and overshoot (analytic cubic extrema); joint radians / gripper fractions")
-    fig.tight_layout()
-    target = path.with_suffix(".ranges.png")
-    fig.savefig(target, dpi=130)
-    plt.close(fig)
-    outputs.append(str(target))
-    path.with_suffix(".ranges.json").write_text(json.dumps(ranges, indent=2))
-    print("Plots: " + ", ".join(outputs))
-    return outputs
+from robotwin_spline import decode, identity, read_cache
+from .adaptive_spline import extract_local, decode_local, select_future_frames
 
 
 def visualize_sample(path, observation_time, scaling, timeline=None, video=None, output_prefix=None):
-    from adaptive_spline import extract_local, decode_local, select_future_frames, identity
     path = Path(path)
     actions, spline, meta = read_cache(path)
     if not meta["diagnostics"]["success"]:
@@ -156,8 +99,6 @@ def visualize_sample(path, observation_time, scaling, timeline=None, video=None,
     if video:
         if not Path(video).exists():
             raise ValueError(f"Referenced video unavailable: {video}; sample arrays saved")
-        import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         from data.utils.image_utils import get_video_frame_count, load_video_frames
         if get_video_frame_count(str(video)) != len(timeline["camera_times"]):
             raise ValueError("Video frame count differs from camera clock")
@@ -184,27 +125,28 @@ def visualize_sample(path, observation_time, scaling, timeline=None, video=None,
     return sample
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cache", type=Path)
-    parser.add_argument("--observation-time", type=float)
+    parser.add_argument("--observation-time", type=float, required=True)
     parser.add_argument("--knot-scaling", type=Path)
     parser.add_argument("--knot-time-scale", type=float, default=100.)
     parser.add_argument("--diagnostic-only", action="store_true")
     parser.add_argument("--timeline", type=Path)
     parser.add_argument("--video", type=Path)
     parser.add_argument("--output-prefix", type=Path)
-    args = parser.parse_args()
-    if args.observation_time is None:
-        visualize(args.cache)
+    args = parser.parse_args(argv)
+    if args.knot_scaling:
+        scaling = json.loads(args.knot_scaling.read_text())
+    elif args.diagnostic_only:
+        scaling = dict(scope="diagnostic-only", units="source_action_step", offset=0., scale=args.knot_time_scale)
     else:
-        if args.knot_scaling:
-            scaling = json.loads(args.knot_scaling.read_text())
-        elif args.diagnostic_only:
-            scaling = dict(scope="diagnostic-only", units="source_action_step", offset=0., scale=args.knot_time_scale)
-        else:
-            parser.error("Supply --knot-scaling or explicitly opt into --diagnostic-only")
-        if scaling["scope"] == "diagnostic-only" and not args.diagnostic_only:
-            parser.error("Diagnostic scaling requires --diagnostic-only")
-        visualize_sample(args.cache, args.observation_time, scaling,
-                         json.loads(args.timeline.read_text()) if args.timeline else None, args.video, args.output_prefix)
+        parser.error("Supply --knot-scaling or explicitly opt into --diagnostic-only")
+    if scaling["scope"] == "diagnostic-only" and not args.diagnostic_only:
+        parser.error("Diagnostic scaling requires --diagnostic-only")
+    visualize_sample(args.cache, args.observation_time, scaling,
+                     json.loads(args.timeline.read_text()) if args.timeline else None, args.video, args.output_prefix)
+
+
+if __name__ == "__main__":
+    main()

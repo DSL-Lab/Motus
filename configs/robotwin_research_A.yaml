@@ -1,4 +1,5 @@
-# Matched dense A. Original configs/robotwin.yaml remains the legacy dense path.
+# Matched dense A. configs/robotwin.yaml retains the original dense path.
+# Requires installed robotwin-spline for research sidecars; see RESEARCH_TRAINING.md.
 base_config: robotwin.yaml
 training_mode: finetune
 research:

@@ -8,6 +8,9 @@ variant="${1:?Supply A or C}"
 cd "$(dirname "$0")/../.."
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+# Install robotwin-spline into this environment before launching the allocation;
+# see RESEARCH_TRAINING.md. No sibling checkout or runtime path injection needed.
+python -c 'import robotwin_spline; from data.robotwin2.adaptive_spline import decode_local'
 out="${MOTUS_DIAGNOSTIC_OUTPUT:?Set a fresh output directory for this diagnostic}"
 config="configs/robotwin_research_${variant}.yaml"
 python train/train.py --config "$config" --checkpoint_dir "$out/train" --report_to none

@@ -122,7 +122,8 @@ def load_contract(config):
         raise ValueError("Representation must be dense or spline")
     normalization = json.loads(Path(research["normalization_path"]).read_text())
     scaling = json.loads(Path(research["knot_scaling_path"]).read_text())
-    from data.robotwin2.adaptive_spline import identity, validate_time_scaling, CHANNELS
+    from robotwin_spline import identity, CHANNELS
+    from data.robotwin2.adaptive_spline import validate_time_scaling
     if normalization["scope"] != "training-only" or normalization["identity"] != identity({k: v for k, v in normalization.items() if k != "identity"}):
         raise ValueError("Research training requires verified training-only action normalization")
     validate_time_scaling(scaling)

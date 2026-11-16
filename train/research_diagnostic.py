@@ -13,7 +13,8 @@ import torch
 @torch.no_grad()
 def generate_diagnostic(model, dataloader, config, output, reference_checkpoint=None):
     from data.dataset import collate_fn
-    from data.robotwin2.adaptive_spline import decode_local, CHANNELS
+    from robotwin_spline import CHANNELS
+    from data.robotwin2.adaptive_spline import decode_local
     from sample import inference_sample
     import matplotlib
     matplotlib.use('Agg')
