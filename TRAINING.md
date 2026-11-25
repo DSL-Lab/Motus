@@ -143,3 +143,5 @@ This will load:
 - [Inference Guide](INFERENCE.md)
 - [Data Format](DATA_FORMAT.md)
 - [RoboTwin Data Conversion](data/robotwin2/robotwin_data_convert/README.md)
+
+The Method A/C Adaptive Spline pilot is isolated in [experiments/ac_spline_pilot](experiments/ac_spline_pilot/README.md).

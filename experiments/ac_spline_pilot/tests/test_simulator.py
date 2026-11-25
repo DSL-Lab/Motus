@@ -75,6 +75,7 @@ class Environment:
         self.total_commands=0
     def setup_demo(self, **kwargs):
         self.take_action_cnt=0
+        self.action_physics_steps=0
         self.step_lim=4
         self.eval_success=False
         self.eval_video_path=None
@@ -87,6 +88,7 @@ class Environment:
         assert np.asarray(command).shape==(14,)
         self.total_commands+=1
         self.take_action_cnt+=1
+        self.action_physics_steps+=3
         self.eval_success=self.take_action_cnt==2
     def close_env(self): pass
 
@@ -116,6 +118,8 @@ class SimulatorTests(unittest.TestCase):
         env=Environment()
         api.class_decorator=lambda name:env
         p=policy(spline=True)
+        p.execution_prefix = dict(p.execution_prefix, row_budget=14)
+        p.spline_diagnostics = True
         manifest=dict(cases=[dict(seed=100000,instruction='place'),dict(seed=100001,instruction='place')],instruction_type='seen')
         with tempfile.TemporaryDirectory() as tmp, patch('utils.vlm_utils.preprocess_vlm_messages',return_value={}):
             records=evaluate_cases(api,p,dict(task_name='place_can_basket',render_freq=0),manifest,Path(tmp))
@@ -125,9 +129,17 @@ class SimulatorTests(unittest.TestCase):
             self.assertTrue(record['success'])
             self.assertEqual(record['policy_calls'],1)
             self.assertEqual(record['executed_commands'],2)
+            self.assertEqual(record['commands_per_call'],[2])
+            self.assertEqual(record['action_physics_steps'],6)
+            self.assertEqual(record['simulated_seconds'],.024)
             self.assertEqual(record['scene_timestep_seconds'],.004)
             self.assertGreaterEqual(record['execution_wall_seconds'],0.)
             self.assertTrue(record['calls'][0]['decoder_report']['repaired_knots'])
+            report = record['calls'][0]['spline_diagnostics']
+            self.assertEqual(report['episode_id'], record['episode_id'])
+            self.assertEqual(report['policy_call_index'], 0)
+            self.assertEqual(report['requested_interval_relative'], [3., 6.])
+            self.assertTrue(report['coverage_valid'] and report['decoder_success'])
         self.assertEqual(env.total_commands,4)
 
     def test_invalid_prefix_is_a_failed_rollout_without_fabricated_commands(self):
@@ -135,6 +147,7 @@ class SimulatorTests(unittest.TestCase):
         env=Environment()
         api.class_decorator=lambda name:env
         p=policy(spline=True)
+        p.spline_diagnostics = True
         p.model.prediction[:,:,0]+=10
         manifest=dict(cases=[dict(seed=100000,instruction='place')],instruction_type='seen')
         with tempfile.TemporaryDirectory() as tmp, patch('utils.vlm_utils.preprocess_vlm_messages',return_value={}):
@@ -144,6 +157,9 @@ class SimulatorTests(unittest.TestCase):
         self.assertEqual(record['executed_commands'],0)
         self.assertEqual(env.total_commands,0)
         self.assertFalse(record['calls'][0]['decoded_valid'])
+        report = record['calls'][0]['spline_diagnostics']
+        self.assertFalse(report['coverage_valid'] or report['decoder_success'])
+        self.assertIn('Insufficient coverage', report['exception'])
 
     def test_setup_failure_keeps_assigned_seed_and_the_other_episode(self):
         api=rollout_api()

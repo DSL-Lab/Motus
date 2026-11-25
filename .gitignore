@@ -231,3 +231,7 @@ datasets/*
 scripts_new/
 scripts/run_local.sh
 scripts/manual_multi_node_srun.sh
+/.runtime/model-metadata/
+
+/pretrained_models/
+/outputs_backup/

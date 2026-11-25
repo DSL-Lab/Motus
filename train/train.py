@@ -255,13 +255,19 @@ class UniDiffuserTrainer:
             current_lr = self.optimizer.param_groups[0]['lr']
             logger.info(f"Current learning rate after checkpoint load (optimizer): {current_lr:.2e}")
     
-    def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
+    def train_step(self, batch: Dict[str, Any], *, force_sync=False, gradient_scale=1.) -> Dict[str, float]:
         if self.accelerator is not None:
             with self.accelerator.accumulate(self.model):
+                if force_sync:
+                    # Flush only the final partial group, preserving accumulation
+                    # across earlier epoch boundaries. This also supports DDP.
+                    self.accelerator.sync_gradients = True
+                    with self.accelerator.trigger_sync_in_backward(self.model):
+                        return self._train_microbatch(batch, gradient_scale=gradient_scale)
                 return self._train_microbatch(batch)
-        return self._train_microbatch(batch)
+        return self._train_microbatch(batch, gradient_scale=gradient_scale)
 
-    def _train_microbatch(self, batch: Dict[str, Any]) -> Dict[str, float]:
+    def _train_microbatch(self, batch: Dict[str, Any], gradient_scale=1.) -> Dict[str, float]:
         """Single training step for UniDiffuser."""
         self.model.train()
         
@@ -304,6 +310,13 @@ class UniDiffuserTrainer:
         else:
             total_loss.backward()
         
+        if gradient_scale != 1.:
+            # Accelerator divided every accumulated loss by its configured group
+            # size. Restore the mean over the actual final (smaller) group.
+            for parameter in self.model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(gradient_scale)
+
         # Gradient clipping
         grad_clip_norm = self.config.training.grad_clip_norm if hasattr(self.config.training, 'grad_clip_norm') else 1.0
         synchronized = self.accelerator is None or self.accelerator.sync_gradients
@@ -331,7 +344,7 @@ class UniDiffuserTrainer:
         """Extension point for inspecting synchronized gradients before updates."""
         pass
 
-    def train(self, max_steps: int, resume_from: Optional[str] = None, val_interval: int = 500, reset_scheduler: Optional[bool] = None):
+    def train(self, max_steps: int, resume_from: Optional[str] = None, val_interval: int = 500, reset_scheduler: Optional[bool] = None, max_epochs: Optional[int] = None):
         """
         Main training loop.
         
@@ -341,6 +354,19 @@ class UniDiffuserTrainer:
             val_interval: Validation interval in steps
             reset_scheduler: If True, reset scheduler to new config. If None, use config.resume.reset_scheduler
         """
+        batches_per_epoch = len(self.train_dataloader)
+        total_batches = None
+        if max_epochs is not None:
+            if isinstance(max_epochs, bool) or not isinstance(max_epochs, int) or max_epochs < 1:
+                raise ValueError('max_epochs must be a positive integer')
+            if resume_from:
+                raise ValueError('Exact epoch training requires a fresh run; mid-epoch resume is not supported')
+            accumulation = self.accelerator.gradient_accumulation_steps if self.accelerator is not None else 1
+            total_batches = max_epochs * batches_per_epoch
+            if not batches_per_epoch or max_steps != (total_batches + accumulation - 1) // accumulation:
+                raise ValueError('Optimizer-step budget disagrees with the exact epoch count')
+        self.microbatches_seen = 0
+
         # Load checkpoint if specified
         if resume_from:
             # Determine whether to reset scheduler
@@ -374,12 +400,22 @@ class UniDiffuserTrainer:
                 batch = next(data_iter)
             
             if batch is None:  # Handle None batches
+                if total_batches is not None:
+                    raise ValueError('Exact epoch training cannot skip an invalid batch')
                 continue
                 
             step_start_time = time.time()
 
             # Training step
-            metrics = self.train_step(batch)
+            if total_batches is not None:
+                final = self.microbatches_seen + 1 == total_batches
+                remainder = total_batches % accumulation or accumulation
+                metrics = self.train_step(batch, force_sync=final,
+                                          gradient_scale=accumulation / remainder if final else 1.)
+            else:
+                metrics = self.train_step(batch)
+            self.microbatches_seen += 1
+            self.epoch = self.microbatches_seen // batches_per_epoch
             if not metrics.pop('_optimizer_step', True):
                 continue
             
@@ -443,7 +479,12 @@ class UniDiffuserTrainer:
                 self.save_checkpoint()
         
         total_time = time.time() - start_time
+        if total_batches is not None and self.microbatches_seen != total_batches:
+            raise RuntimeError('Training stopped before consuming the exact epoch budget')
         if self.rank == 0:
+            if total_batches is not None:
+                logger.info('Completed %d epochs, %d microbatches and %d optimizer updates',
+                            self.epoch, self.microbatches_seen, self.global_step)
             logger.info(f"UniDiffuser training completed in {total_time:.2f}s ({self.global_step} steps)")
             self.save_checkpoint()
 
@@ -594,7 +635,8 @@ class TrainingFactory:
     def run(self, trainer, args, config):
         trainer.train(max_steps=config.training.max_steps,
                       resume_from=config.resume.checkpoint_path,
-                      val_interval=config.system.val_interval)
+                      val_interval=config.system.val_interval,
+                      max_epochs=config.training.get('num_epochs'))
 
 
 def reporting_backends(value):

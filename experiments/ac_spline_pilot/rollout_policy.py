@@ -7,7 +7,7 @@ import time
 import numpy as np
 import torch
 
-from data.robotwin2.adaptive_spline import decode_local, prepare_local
+from data.robotwin2.adaptive_spline import decode_execution
 
 ROBOTWIN_ROOT = Path(__file__).resolve().parents[3] / 'WAM-RoboTwin'
 
@@ -43,20 +43,25 @@ def encode_instructions(instructions, config):
 
 def load_policy(checkpoint, instructions):
     """Rebuild the saved architecture/base/adapters; validate the exact bundle."""
-    from omegaconf import OmegaConf
+    model, config, language, metadata = load_checkpoint(checkpoint, instructions)
     from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained(config.model.vlm.checkpoint_path, trust_remote_code=True)
+    return RolloutPolicy(model, config, metadata['contract'], language, processor)
+
+
+def load_checkpoint(checkpoint, instructions=()):
+    from omegaconf import OmegaConf
     from .trainer import create_ac_model
     from .research import load_research_bundle
     checkpoint = Path(checkpoint)
     metadata = json.loads((checkpoint / 'research_config.json').read_text())
     config = OmegaConf.create(metadata['config'])
     config.research.contract = metadata['contract']
-    language = encode_instructions(instructions, config)
+    language = encode_instructions(instructions, config) if instructions else {}
     model = create_ac_model(config)
     load_research_bundle(model, checkpoint)
     model.eval()
-    processor = AutoProcessor.from_pretrained(config.model.vlm.checkpoint_path, trust_remote_code=True)
-    return RolloutPolicy(model, config, metadata['contract'], language, processor)
+    return model, config, language, metadata
 
 
 class RolloutPolicy:
@@ -68,10 +73,14 @@ class RolloutPolicy:
         self.language, self.processor = language, processor
         self.device = next(model.parameters()).device
         self.seed = 0
+        self.episode_id = None
+        self.spline_diagnostics = bool(getattr(getattr(config, 'research', None), 'spline_diagnostics', False))
+        self.execution_prefix = contract.get('executed_prefix')
         self.reset()
 
-    def begin_episode(self, seed, instruction):
+    def begin_episode(self, seed, instruction, episode_id=None):
         self.seed, self.instruction = int(seed), instruction
+        self.episode_id = self.seed if episode_id is None else episode_id
         self.reset()
 
     def reset(self):
@@ -89,6 +98,18 @@ class RolloutPolicy:
             raise NotImplementedError(func_name)
 
     def get_action(self):
+        call = dict(index=len(self.calls), decoded_valid=False)
+        self.calls.append(call)
+        started = time.perf_counter()
+        try:
+            return self._get_action(call)
+        except Exception as exc:
+            call['error'] = f'{type(exc).__name__}: {exc}'
+            raise
+        finally:
+            call['total_wall_seconds'] = time.perf_counter() - started
+
+    def _get_action(self, call):
         from data.utils.image_utils import resize_with_padding, tensor_to_pil
         from utils.vlm_utils import preprocess_vlm_messages
         if self.observation is None:
@@ -110,41 +131,49 @@ class RolloutPolicy:
             raise ValueError('Expected finite raw 6+1+6+1 robot state')
         vlm = preprocess_vlm_messages(prefix + self.instruction, tensor_to_pil(frame), self.processor)
         vlm = {key: value.to(self.device) if isinstance(value, torch.Tensor) else value for key, value in vlm.items()}
-        call = dict(index=len(self.calls), decoded_valid=False)
-        self.calls.append(call)
+        spline = self.contract['representation'] == 'spline'
+        diagnostics = None
+        if spline and self.spline_diagnostics:
+            diagnostics = dict(episode_id=self.episode_id, policy_call_index=call['index'],
+                               coverage_valid=None, decoder_success=False)
+            call['spline_diagnostics'] = diagnostics
         devices = [self.device.index or 0] if self.device.type == 'cuda' else []
-        if devices:
-            torch.cuda.synchronize(self.device)
-        started = time.perf_counter()
+        frame = frame[None].to(self.device)
+        state = torch.from_numpy(state.astype(np.float32))[None].to(self.device)
+        language = [self.language[self.instruction].to(self.device)]
         try:
             # Keep model noise matched by scene/call, without changing simulator RNG.
             with torch.random.fork_rng(devices=devices), torch.inference_mode():
                 torch.manual_seed((self.seed << 32) + call['index'])
+                if devices:
+                    torch.cuda.synchronize(self.device)
+                started = time.perf_counter()
                 _, prediction = self.model.inference_step(
-                    first_frame=frame[None].to(self.device),
-                    state=torch.from_numpy(state.astype(np.float32))[None].to(self.device),
+                    first_frame=frame, state=state,
                     num_inference_steps=int(self.config.model.inference.num_inference_timesteps),
-                    language_embeddings=[self.language[self.instruction].to(self.device)], vlm_inputs=vlm)
-            if devices:
-                torch.cuda.synchronize(self.device)
+                    language_embeddings=language, vlm_inputs=vlm)
+                if devices:
+                    torch.cuda.synchronize(self.device)
+                call['inference_wall_seconds'] = time.perf_counter() - started
             parameters = prediction[0].float().cpu().numpy()
-            call['inference_wall_seconds'] = time.perf_counter() - started
-            started = time.perf_counter()
-            count = self.contract['executed_prefix']['command_count']
-            if self.contract['representation'] == 'spline':
-                _, _, report = prepare_local(parameters, self.contract['knot_scaling'])
-                call['decoder_report'] = report
-                times = self.contract['executed_prefix']['source_stride'] * np.arange(1, count + 1)
-                commands, report = decode_local(parameters, times, 0., self.contract['knot_scaling'], self.contract['normalization'])
+            if spline:
+                started = time.perf_counter()
+                try:
+                    commands, report = decode_execution(parameters, self.contract['knot_scaling'],
+                        self.contract['normalization'], self.execution_prefix, diagnostics=diagnostics)
+                finally:
+                    call['decode_wall_seconds'] = time.perf_counter() - started
                 call['decoder_report'] = report
             else:
                 commands = parameters
-            if commands.shape != (count, 14) or not np.isfinite(commands).all():
+            count = len(commands) if spline and 'row_budget' in self.execution_prefix else self.execution_prefix['command_count']
+            if not count or commands.shape != (count, 14) or not np.isfinite(commands).all():
                 raise ValueError('Invalid decoded action chunk')
             call['decoded_valid'] = True
+            if diagnostics is not None:
+                diagnostics['decoder_success'] = True
             return commands
         except Exception as exc:
-            call['error'] = f'{type(exc).__name__}: {exc}'
+            if diagnostics is not None:
+                diagnostics['exception'] = str(exc)
             raise
-        finally:
-            call['decode_wall_seconds' if 'inference_wall_seconds' in call else 'failed_inference_wall_seconds'] = time.perf_counter() - started

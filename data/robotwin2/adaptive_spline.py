@@ -63,44 +63,67 @@ def extract_local(spline, observation_time, scaling):
                 knot_encoding="observation-relative absolute position; (time-offset)/scale")
 
 
-def prepare_local(parameters, scaling, *, repair_knots=True):
+def prepare_local(parameters, scaling, *, repair_knots=True, rows=36, diagnostics=None):
     """Invert absolute knot scaling and apply Appendix D decoding safeguards.
 
+    The positive affine inverse commutes with running maximum. Repair all
+    predicted knots in source-step units, including the boundary support.
     Running maximum preserves row order. Removing a leading surplus endpoint
     knot removes the leading inactive coefficient; trailing trimming removes
     trailing inactive coefficients. Interior multiplicities remain unchanged
     and are checked by the shared strict evaluator.
     """
     offset, scale = validate_time_scaling(scaling)
+    if type(rows) is not int or not 8 <= rows <= 36:
+        raise ValueError("Execution row budget must be an integer between 8 and 36")
     a = np.asarray(parameters, dtype=np.float64)
-    if a.shape != (36, 15) or not np.isfinite(a).all():
+    if a.shape != (36, 15):
         raise ValueError("Invalid packed parameters: expected finite (36,15)")
     with np.errstate(over="ignore", invalid="ignore"):
         raw = a[:, 0] * scale + offset
+    if diagnostics is not None:
+        diagnostics.update(degree=3, execution_rows=rows,
+                           raw_knots=[float(k) if np.isfinite(k) else None for k in raw])
+    if not np.isfinite(a[:, 0]).all():
+        raise ValueError("Invalid packed parameters: expected finite (36,15)")
     if not np.isfinite(raw).all():
         raise ValueError("Nonfinite knots after inverse scaling")
     if not repair_knots and np.any(np.diff(raw) < 0):
         raise ValueError("Invalid knots: decreasing times; repair is disabled")
-    u = np.maximum.accumulate(raw) if repair_knots else raw.copy()
-    delta = u - raw
-    start, end = 0, len(u)
-    # Cubic endpoints admit four repetitions. Keep len(u) == len(cp) + 4
-    # and the original coefficient association after either boundary trim.
-    while end - start > 8 and u[start] == u[start + 4]:
-        start += 1
-    while end - start > 8 and u[end - 5] == u[end - 1]:
-        end -= 1
+    repaired = np.maximum.accumulate(raw) if repair_knots else raw
+    delta = np.abs(repaired - raw)
+    u = repaired[:rows]
+    start, end = 0, rows
+    lo, hi = u[3], u[rows - 4]
+    if lo < hi:
+        # Excess runs at the active boundaries can also include support knots.
+        # Drop only coefficients with empty support on the active interval.
+        left = np.searchsorted(u, lo, side="left")
+        right = np.searchsorted(u, lo, side="right")
+        if right - left > 4:
+            start = int(right) - 4
+        left = np.searchsorted(u, hi, side="left")
+        right = np.searchsorted(u, hi, side="right")
+        if right - left > 4:
+            end = int(left) + 4
     knots, cp = u[start:end], a[start:end - 4, 1:]
-    report = dict(repaired_knots=bool(np.any(delta)),
-        repaired_knot_count=int(np.count_nonzero(delta)),
+    modified = int(np.count_nonzero(delta))
+    report = dict(repaired_knots=bool(modified), repaired_knot_count=modified,
         knot_repair_max_source_steps=float(delta.max()),
         knot_repair_mean_source_steps=float(delta.mean()),
         knot_repair_max_normalized=float(delta.max() / scale),
         raw_knots_finite=True, raw_knots_monotone=bool(np.all(np.diff(raw) >= 0)),
-        raw_domain_relative=[float(raw[3]), float(raw[-4])],
-        valid_interval_relative=[float(knots[3]), float(knots[-4])],
-        trimmed_head_knots=start, trimmed_tail_knots=36 - end,
+        raw_domain_relative=[float(raw[3]), float(raw[rows - 4])],
+        valid_interval_relative=[float(knots[3]), float(knots[len(cp)])],
+        trimmed_head_knots=start, trimmed_tail_knots=rows - end,
         decoding_policy="absolute knots; running maximum; trim surplus endpoints; no extrapolation")
+    if diagnostics is not None:
+        diagnostics.update(report, repaired_knots_vector=repaired.tolist(),
+                           repair_rate=modified / len(raw), repair_displacement=float(delta.mean()),
+                           max_knot_multiplicity=int(np.unique(repaired, return_counts=True)[1].max()),
+                           effective_control_points=len(cp))
+    if not np.isfinite(a[:, 1:]).all():
+        raise ValueError("Invalid packed parameters: expected finite control points")
     return knots, cp, report
 
 
@@ -117,6 +140,21 @@ def decode_local(parameters, timestamps, observation_time, scaling, normalizatio
     return commands, dict(report, **safeguards,
         gripper_out_of_range_count=int(np.count_nonzero((commands[:, [6, 13]] < 0) | (commands[:, [6, 13]] > 1))),
         gripper_policy="continuous unchanged; simulator retains its existing saturation")
+
+
+def decode_execution(parameters, scaling, normalization, prefix, *, diagnostics=None):
+    """Decode a RoboTwin controller grid from the current observation."""
+    rows = prefix.get("row_budget")
+    stride = prefix["source_stride"]
+    knots, cp, report = prepare_local(parameters, scaling, rows=36 if rows is None else rows,
+                                      diagnostics=diagnostics)
+    # The paper starts at local time zero on its controller grid. RoboTwin's
+    # matched action convention requires the first command at source row +3.
+    count = prefix["command_count"] if rows is None else max(1, int(np.floor(knots[len(cp)] / stride)))
+    times = stride * np.arange(1, count + 1, dtype=float)
+    commands, evaluation = evaluate_local(knots, cp, times, 0., normalization,
+                                          boundary_scale=None, diagnostics=diagnostics)
+    return commands, dict(evaluation, **report)
 
 
 def fit_knot_time_scaling(caches):
@@ -220,6 +258,6 @@ def select_future_frames(sample, action_times, camera_times, *, count=8, knot_of
                 frames=records, raw_frame_valid=raw_valid, conservative_latent_valid=latent_valid,
                 proposed_latent_loss_mask=[False] + latent_valid[1:], proposed_latent_key_mask=latent_valid,
                 unchanged_motus_training_compatible=all(raw_valid),
-                mask_status="inspection-only; MOTUS currently consumes neither mask; padded samples blocked",
+                mask_status="MOTUS masks padded future latents in attention and video loss",
                 settings=dict(count=count, knot_offset=knot_offset, knot_stride=knot_stride,
                               rounding="nearest timestamp, earlier index on ties", vae_future_group=4))

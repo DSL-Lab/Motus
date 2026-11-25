@@ -1,0 +1,9 @@
+base_config: robotwin_pilot_A.yaml
+research:
+  train_episodes: 150
+  validation_episodes: 20
+  adaptive_spline_windows: true
+dataset:
+  max_episodes: 170
+system:
+  checkpoint_dir: outputs/ac_splinewam_A_170/train

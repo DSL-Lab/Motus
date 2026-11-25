@@ -199,3 +199,5 @@ If you find our work helpful, please cite us:
 
 Thank you!
 
+
+The Method A/C Adaptive Spline pilot is isolated in [experiments/ac_spline_pilot](experiments/ac_spline_pilot/README.md).

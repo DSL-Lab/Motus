@@ -10,7 +10,7 @@ from robotwin_spline.sidecar import VERSION
 from .adaptive_spline import extract_local, decode_local, select_future_frames
 
 
-def prepare_window(spline, obs, scaling, normalization, action_times, camera_times):
+def prepare_window(spline, obs, scaling, normalization, action_times, camera_times, *, adaptive=False):
     """Build and validate one fixed A/C window for preparation and loading."""
     if not isinstance(obs, int) or not 0 <= obs < len(action_times):
         raise ValueError("Observation must be an original source-row integer index")
@@ -18,13 +18,20 @@ def prepare_window(spline, obs, scaling, normalization, action_times, camera_tim
     # Check the actual packed target against its global parent before it can
     # reach training. The original command grid remains stride three.
     dense_indices = np.minimum(obs + 3 * np.arange(1, 17), len(action_times) - 1)
-    target_decoded, _ = decode_local(packet["parameters"], dense_indices, obs, scaling, normalization)
-    if not np.allclose(target_decoded, decode(spline(dense_indices), normalization), atol=2e-5, rtol=0):
+    validation_indices = dense_indices
+    if adaptive:
+        start, end = packet["valid_interval_relative"]
+        if not start <= 0 or end < 3:
+            raise ValueError("Ground-truth spline must cover the observation and first RoboTwin command")
+        validation_indices = np.arange(obs, obs + int(np.floor(end)) + 1)
+    target_decoded, _ = decode_local(packet["parameters"], validation_indices, obs, scaling, normalization,
+                                     repair_knots=False)
+    if not np.allclose(target_decoded, decode(spline(validation_indices), normalization), atol=2e-5, rtol=0):
         raise ValueError("Local/global packed-target round trip failed")
     selection = select_future_frames(packet, action_times, camera_times)
     if selection['current_camera_timestamp'] > selection['current_timestamp']:
         raise ValueError('Nearest current camera frame lies in the future; select a causal observation window')
-    if not any(selection["proposed_latent_loss_mask"]):
+    if not adaptive and not any(selection["proposed_latent_loss_mask"]):
         raise ValueError("Window has no valid future latent under conservative causal VAE mask")
     return packet, dense_indices, selection
 
@@ -37,6 +44,8 @@ def _load_episode(window, expected, train_keys, val):
         raise ValueError("Incompatible or modified spline cache metadata; regenerate with robotwin_spline.convert")
     if not meta["diagnostics"]["success"] or meta["normalization"] != expected:
         raise ValueError("Failed fit or inconsistent training normalization")
+    if Path(meta['source']['path']).resolve() != Path(window['qpos_path']).resolve():
+        raise ValueError('Spline sidecar belongs to a different recorded episode')
     if hashlib.sha256(actions.tobytes()).hexdigest() != meta['source']['action_sha256']:
         raise ValueError('Cached commands do not match their source identity')
     tolerance = meta['diagnostics']['settings']['tolerance']
@@ -89,6 +98,7 @@ def load_windows(path, val, contract):
         raise ValueError("Window manifest has no requested split")
     expected = contract["normalization"]
     train_keys = {(s["path"], s["action_sha256"]) for s in expected["training_sources"]}
+    adaptive = contract.get("adaptive_spline_windows", False) or "row_budget" in contract.get("executed_prefix", {})
     episodes = {}
     for window in windows:
         for key in ("qpos_path", "video_path", "lang_path", "cache_path", "timeline_path"):
@@ -103,7 +113,8 @@ def load_windows(path, val, contract):
         actions, spline, meta, timeline = episodes[key]
         packet, dense_indices, selection = prepare_window(
             spline, window["observation_index"], contract["knot_scaling"], expected,
-            timeline["action_times"], timeline["camera_times"])
+            timeline["action_times"], timeline["camera_times"],
+            adaptive=adaptive)
         # Cache only the explicit target and clock metadata, never image arrays.
         window["_packet"], window["_selection"] = packet, selection
         window["_dense_indices"], window["_actions"] = dense_indices, actions

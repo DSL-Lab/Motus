@@ -46,10 +46,11 @@ if os.environ.get('TEST_FAIL'):
 if 'experiments.ac_spline_pilot.trainer' in arguments and not os.environ.get('TEST_OMIT_CHECKPOINT'):
     variant = 'A' if 'robotwin_pilot_A.yaml' in ' '.join(arguments) else 'C'
     root = Path(arguments[arguments.index('--checkpoint_dir')+1])
-    checkpoint = root / ('robotwin_pilot_'+variant) / 'pilot-seed-0/checkpoint_step_1000'
+    checkpoint = root / ('robotwin_pilot_'+variant) / 'pilot-seed-0/checkpoint_step_17'
     checkpoint.mkdir(parents=True)
     (checkpoint/'research_adapter.pt').touch()
     (checkpoint/'research_config.json').write_text('{}')
+    (checkpoint.parent/'final_checkpoint.txt').write_text('checkpoint_step_17\\n')
 if 'experiments.ac_spline_pilot.simulator' in arguments and os.environ.get('TEST_SIM_FAIL_A'):
     if arguments[arguments.index('--output')+1].endswith('/A'):
         sys.exit(9)
@@ -101,7 +102,7 @@ print('123;cluster' if '--parsable' in sys.argv else 'Submitted batch job 456')
         calls = [json.loads(line)['args'] for line in (self.root/'calls.jsonl').read_text().splitlines()]
         for variant, call in zip(('A','C'), calls[2:]):
             self.assertEqual(call[:3], ['-u','-m','experiments.ac_spline_pilot.simulator'])
-            self.assertEqual(call[call.index('--checkpoint')+1], str(self.root/f'outputs/run/{variant}/robotwin_pilot_{variant}/pilot-seed-0/checkpoint_step_1000'))
+            self.assertEqual(call[call.index('--checkpoint')+1], str(self.root/f'outputs/run/{variant}/robotwin_pilot_{variant}/pilot-seed-0/checkpoint_step_17'))
             self.assertEqual(call[call.index('--cases')+1], str(self.root/'outputs/run/simulator/cases.json'))
             self.assertEqual(call[call.index('--episodes')+1], '7')
             self.assertEqual(call[call.index('--seed')+1], '2')
@@ -123,7 +124,7 @@ print('123;cluster' if '--parsable' in sys.argv else 'Submitted batch job 456')
         self.env['TEST_OMIT_CHECKPOINT']='1'
         result=self.run_script()
         self.assertEqual(result.returncode,2,result.stdout+result.stderr)
-        self.assertIn('did not produce its final checkpoint',result.stderr)
+        self.assertIn('did not publish its final checkpoint',result.stderr)
         self.assertEqual(len((self.root/'calls.jsonl').read_text().splitlines()),1)
 
     def test_evaluation_failure_still_attempts_the_other_policy(self):

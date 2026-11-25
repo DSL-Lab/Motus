@@ -37,7 +37,11 @@ def generate_diagnostic(model, dataloader, config, output, reference_checkpoint=
         obs = info['observation_index']
         times = np.asarray(info['dense_indices'], dtype=float)
         target = batch['action_sequence'][0].float().numpy()
-        if contract['representation'] == 'spline':
+        if 'row_budget' in contract['executed_prefix']:
+            # The fixed-grid diagnostic compares to recorded commands, which
+            # remain defined even past the local target's adaptive horizon.
+            target_commands = dataset.research_windows[index]['_actions'][times.astype(int)]
+        elif contract['representation'] == 'spline':
             target_commands, _ = decode_local(target, times, obs, contract['knot_scaling'], contract['normalization'])
         else:
             target_commands = target
@@ -101,6 +105,8 @@ def generate_diagnostic(model, dataloader, config, output, reference_checkpoint=
                   target_rows=model.config.action_chunk_size,
                   action_branch_tokens=model.config.action_chunk_size + 1 + model.action_expert.config.num_registers,
                   reload_check='not_requested')
+    if 'row_budget' in contract['executed_prefix']:
+        report['scoring_grid'] = 'fixed RoboTwin stride-three grid against recorded commands'
     if reference_checkpoint:
         previous = Path(reference_checkpoint).parent / 'generation' / 'predictions.npz'
         with np.load(previous, allow_pickle=False) as original:

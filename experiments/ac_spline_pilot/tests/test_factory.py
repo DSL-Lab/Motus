@@ -50,9 +50,9 @@ class FactoryTests(unittest.TestCase):
             env.update(SLURM_JOB_ID='test', SLURMD_NODENAME='test')
             with patch.dict(os.environ, env), patch('torch.cuda.is_available', return_value=True), \
                     patch('data.robotwin2.research_windows.load_windows', return_value=[{
-                        'qpos_path': str(Path(directory) / 'place_can_basket/qpos/0.pt')}]) as windows:
+                        'qpos_path': str(Path(directory) / 'place_can_basket/qpos/0.pt')}] * 1122) as windows:
                 profiles = [('research', 'A', (14, 16), 100), ('research', 'C', (15, 36), 100),
-                            ('pilot', 'A', (14, 16), 1000), ('pilot', 'C', (15, 36), 1000)]
+                            ('pilot', 'A', (14, 16), 1052), ('pilot', 'C', (15, 36), 1052)]
                 for profile, variant, shape, steps in profiles:
                     self.namespace['load_contract'].return_value = {'representation': 'dense' if variant == 'A' else 'spline'}
                     path = self.config_path.with_name(f'robotwin_{profile}_{variant}.yaml')
@@ -61,6 +61,10 @@ class FactoryTests(unittest.TestCase):
                     self.assertEqual((result.common.action_dim, result.common.action_chunk_size), shape)
                     self.assertEqual(result.common.action_precision, 'float32')
                     self.assertEqual(result.training.max_steps, steps)
+                    if profile == 'pilot':
+                        self.assertEqual(result.training.num_epochs, 15)
+                        self.assertEqual(result.training.cycle_length, 1052)
+                        self.assertEqual(result.system.val_interval, 1052)
                     self.assertEqual(result.training.gradient_accumulation_steps, 16 if profile == 'pilot' else 1)
                     self.assertEqual(result.dataset.params.window_manifest, directory)
                     self.assertEqual(result.dataset.params.research_contract, result.research.contract)

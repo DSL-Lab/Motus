@@ -157,6 +157,14 @@ def load_contract(config):
                     decoder="data.robotwin2.adaptive_spline.decode_local", flow="x_sigma=(1-sigma)*target+sigma*noise; v=noise-target",
                     gripper="continuous fraction; no threshold", lora=research["lora"],
                     window_manifest_sha256=hashlib.sha256(Path(research["window_manifest"]).read_bytes()).hexdigest())
+    if research.get("adaptive_spline_windows", False):
+        contract["adaptive_spline_windows"] = True
+    rows = research.get("spline_execution_rows")
+    if rows is not None:
+        if representation != "spline" or type(rows) is not int or not 8 <= rows <= 36:
+            raise ValueError("Spline execution requires an integer row budget between 8 and 36")
+        contract["executed_prefix"]["row_budget"] = rows
+        contract["decoder"] = "data.robotwin2.adaptive_spline.decode_execution"
     contract["identity"] = identity(contract)
     return contract
 

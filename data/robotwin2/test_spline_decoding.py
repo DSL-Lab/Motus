@@ -4,7 +4,7 @@ import unittest
 import numpy as np
 from scipy.interpolate import BSpline
 
-from data.robotwin2.adaptive_spline import decode_local, prepare_local
+from data.robotwin2.adaptive_spline import decode_execution, decode_local, extract_local, prepare_local
 from data.robotwin2.spline_diagnostics import score_spline_prediction
 
 
@@ -56,13 +56,85 @@ class PredictionSafeguards(unittest.TestCase):
         self.assertEqual(report['trimmed_tail_knots'], 4)
         self.assertEqual(report['effective_control_points'], 26)
 
+    def test_uniform_and_nonuniform_windows_use_canonical_active_domain(self):
+        for knots in (np.arange(36.) - 5., np.cumsum(np.linspace(.5, 2., 36)) - 5.):
+            self.packet[:, 0] = knots
+            domain = knots[[3, 32]]
+            times = np.linspace(*domain, 51)
+            commands, report = decode_local(self.packet, times, 0., self.scaling, self.norm)
+            np.testing.assert_allclose(commands, BSpline(knots, self.packet[:32, 1:], 3)(times), atol=1e-14)
+            self.assertEqual(report['valid_interval_relative'], domain.tolist())
+            self.assertEqual(report['effective_control_points'], 32)
+
+    def test_excess_at_active_boundary_and_repeated_nonclamped_right_endpoint(self):
+        self.packet[:, 0] = np.r_[[-2., -1.], np.zeros(5), np.arange(1., 22.),
+                                 np.full(6, 22.), [23., 24.]]
+        knots, coefficients, report = prepare_local(self.packet, self.scaling)
+        self.assertEqual(report['valid_interval_relative'], [0., 22.])
+        self.assertEqual((report['trimmed_head_knots'], report['trimmed_tail_knots']), (3, 4))
+        np.testing.assert_array_equal(coefficients, self.packet[3:28, 1:])
+        values, _ = decode_local(self.packet, [0., 22.], 0., self.scaling, self.norm)
+        np.testing.assert_allclose(values, coefficients[[0, -1]])
+        self.packet[:, 0] = np.arange(36.)
+        self.packet[31, 0] = 32.
+        values, _ = decode_local(self.packet, [32.], 0., self.scaling, self.norm)
+        expected = BSpline(self.packet[:, 0], self.packet[:32, 1:], 3)(np.nextafter(32., 0.))
+        np.testing.assert_allclose(values[0], expected, atol=1e-14)
+
+    def test_local_target_uses_observation_span_and_preserves_parent_curve(self):
+        knots = np.r_[np.zeros(4), np.arange(2., 98., 2), np.full(4, 98.)]
+        control = np.arange((len(knots) - 4) * 14).reshape(-1, 14) / 1000.
+        parent = BSpline(knots, control, 3, extrapolate=False)
+        scaling = dict(self.scaling, offset=27., scale=100.)
+        for observation in (0, 13, 14, 93):
+            packet = extract_local(parent, observation, scaling)
+            span = np.searchsorted(knots, observation, side='right') - 1
+            self.assertEqual(packet['global_start'], span - 3)
+            lower, upper = packet['valid_interval_relative']
+            self.assertLessEqual(lower, 0.)
+            times = np.arange(observation, observation + upper + 1.)
+            commands, report = decode_local(packet['parameters'], times, observation, scaling, self.norm,
+                                            repair_knots=False)
+            np.testing.assert_allclose(commands, parent(times), atol=1e-7)
+            np.testing.assert_allclose(report['valid_interval_relative'], [lower, upper], atol=5e-6)
+
+    def test_adaptive_execution_keeps_stride_and_reports_failed_first_command(self):
+        self.packet[:, 0] = np.arange(36.) * 2 - 8
+        self.packet[8, 0] = 5.
+        diagnostics = {}
+        prefix = dict(row_budget=12, source_stride=3)
+        commands, report = decode_execution(self.packet, self.scaling, self.norm, prefix, diagnostics=diagnostics)
+        self.assertEqual(commands.shape, (2, 14))
+        self.assertEqual(report['valid_interval_relative'], [-2., 6.])
+        self.assertEqual(diagnostics['requested_interval_relative'], [3., 6.])
+        self.assertTrue(diagnostics['coverage_valid'])
+        self.assertEqual(diagnostics['repaired_knot_count'], 1)
+        self.assertAlmostEqual(diagnostics['repair_rate'], 1 / 36)
+        self.assertAlmostEqual(diagnostics['repair_displacement'], 1 / 36)
+        # Reproduce a backward-moving support knot that pushes U[3] late.
+        self.packet[1:4, 0] = [4., -3., -2.]
+        with self.assertRaisesRegex(ValueError, 'Insufficient coverage'):
+            decode_execution(self.packet, self.scaling, self.norm, prefix, diagnostics=diagnostics)
+        self.assertEqual(diagnostics['raw_knots'][3], -2.)
+        self.assertEqual(diagnostics['repaired_knots_vector'][3], 4.)
+        self.assertEqual(diagnostics['requested_interval_relative'][0], 3.)
+        self.assertFalse(diagnostics['coverage_valid'])
+
     def test_invalid_interior_multiplicity_and_degenerate_domain_rejected(self):
         self.packet[10:15, 0] = self.packet[10, 0]
         with self.assertRaisesRegex(ValueError, 'multiplicity'):
             decode_local(self.packet, [3.], 0., self.scaling, self.norm)
         self.packet[:, 0] = 0.
-        with self.assertRaisesRegex(ValueError, 'multiplicity|degenerate'):
+        with self.assertRaisesRegex(ValueError, 'multiplicity|Degenerate'):
             decode_local(self.packet, [0.], 0., self.scaling, self.norm)
+
+    def test_valid_internal_multiplicity_uses_right_piece_at_the_knot(self):
+        self.packet[:, 0] = np.repeat([0., 1., 2.], [4, 4, 28])
+        self.packet[:4, 1:] = .2
+        self.packet[4:, 1:] = .8
+        times = [0., .7, 1., 1.4, 2.]
+        values, _ = decode_local(self.packet, times, 0., self.scaling, self.norm)
+        np.testing.assert_allclose(values, np.repeat([[.2], [.2], [.8], [.8], [.8]], 14, axis=1))
 
     def test_running_maximum_does_not_repair_excess_interior_repetitions(self):
         self.packet[10:15, 0] = [-1., -2., -3., -4., -5.]

@@ -264,6 +264,35 @@ class ComponentTests(unittest.TestCase):
         self.assertIsNotNone(layer.lora_B.grad)
         self.assertIsNone(layer.base.weight.grad)
 
+    def test_vlm_adapters_receive_gradients_through_actual_feature_extraction(self):
+        ns = component_namespace()
+        definitions('models/motus.py', {'UndModule'}, ns)
+        class LanguageModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.projection = nn.Linear(8, 8)
+            def forward(self, inputs_embeds, **kwargs):
+                return types.SimpleNamespace(hidden_states=[self.projection(inputs_embeds)])
+        model = Harness('spline')
+        model.vlm_model = nn.Module()
+        model.vlm_model.model = nn.Module()
+        model.vlm_model.model.language_model = LanguageModel()
+        model.vlm_model.vision = nn.Linear(8, 8)
+        configure_adapters(model, dict(rank=2, alpha=4., target_modules=['*']))
+        und = ns['UndModule'](model.vlm_model, model.und_expert, model.config,
+                              torch.float32, torch.device('cpu'))
+        inputs = torch.randn(1, 2, 8)
+        und._process_vlm_inputs_to_tokens = lambda batch, count: (
+            model.vlm_model.vision(inputs), None, None, None, None)
+        batch = {'input_ids': torch.zeros(1, 2, dtype=torch.long)}
+        und.extract_und_features(batch).square().mean().backward()
+        for layer in [model.vlm_model.model.language_model.projection, model.vlm_model.vision]:
+            self.assertIsNotNone(layer.lora_B.grad)
+            self.assertGreater(float(layer.lora_B.grad.norm()), 0.)
+            self.assertIsNone(layer.base.weight.grad)
+        with torch.no_grad():
+            self.assertFalse(und.extract_und_features(batch).requires_grad)
+
     def test_masked_keys_cannot_affect_action_or_understanding(self):
         ns = component_namespace()
         attention = ns['WanSelfAttention'](12, 1)
@@ -289,8 +318,11 @@ class ComponentTests(unittest.TestCase):
         masked_video_loss(pred, target, torch.tensor([[True,True,False]]).expand(2,-1)).backward()
         self.assertTrue(torch.all(pred.grad[:,:,0] == 0))
         self.assertTrue(torch.all(pred.grad[:,:,2] == 0))
-        with self.assertRaises(ValueError):
-            masked_video_loss(pred, target, torch.tensor([[True,False,False]]).expand(2,-1))
+        pred.grad.zero_()
+        empty_loss = masked_video_loss(pred, target, torch.tensor([[True,False,False]]).expand(2,-1))
+        self.assertEqual(empty_loss.item(), 0.)
+        empty_loss.backward()
+        self.assertTrue(torch.all(pred.grad == 0))
 
     def test_serialized_adapters_projections_fresh_process(self):
         directory = fixture_directory()

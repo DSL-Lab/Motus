@@ -346,7 +346,9 @@ class UndModule(nn.Module):
         if deepstack_image_embeds is not None:
             vlm_kwargs['deepstack_visual_embeds'] = deepstack_image_embeds
 
-        with torch.no_grad():
+        # Respect trainable VLM adapters while avoiding graphs for frozen VLMs.
+        with torch.set_grad_enabled(torch.is_grad_enabled() and
+                                    any(p.requires_grad for p in self.vlm_model.parameters())):
             vlm_output = self.vlm_model.model.language_model(**vlm_kwargs)
 
         # Extract last layer features directly

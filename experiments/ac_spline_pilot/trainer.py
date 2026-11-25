@@ -66,10 +66,14 @@ class ACSplineFactory(TrainingFactory):
         config.common.action_precision = 'float32'
         if not os.environ.get('SLURM_JOB_ID') or not os.environ.get('SLURMD_NODENAME') or not torch.cuda.is_available():
             raise RuntimeError('Research model execution requires allocated Slurm compute; never use a login node')
-        phase_limits = {'tiny': 100, 'pilot': 1000}
         phase = config.research.phase
-        if phase not in phase_limits or not 1 <= config.training.max_steps <= phase_limits[phase]:
-            raise ValueError('A/C supports tiny runs up to 100 updates or pilot runs up to 1000 updates')
+        epochs = config.training.get('num_epochs')
+        if epochs is not None:
+            if phase != 'pilot' or isinstance(epochs, bool) or not isinstance(epochs, int) or not 1 <= epochs <= 15:
+                raise ValueError('Pilot epoch runs support 1 to 15 integer epochs')
+        elif phase not in ('tiny', 'pilot') or not 1 <= config.training.max_steps <= (100 if phase == 'tiny' else 1000):
+            # Old step-based checkpoint configs remain loadable for diagnostics.
+            raise ValueError('Step-based A/C supports tiny runs up to 100 updates or pilot runs up to 1000 updates')
         if config.training_mode != 'finetune':
             raise ValueError('Matched A/C require current observation and state conditioning')
         if args.deepspeed:
@@ -87,6 +91,12 @@ class ACSplineFactory(TrainingFactory):
                 if (window.get('task_name') != config.dataset.task_name
                         and config.dataset.task_name not in Path(window['qpos_path']).parts):
                     raise ValueError(f"Fixed window does not belong to {config.dataset.task_name}: {window['qpos_path']}")
+            if not validation and epochs is not None:
+                batches = len(windows) // int(config.training.batch_size)
+                if not batches or len(windows) % int(config.training.batch_size):
+                    raise ValueError('Epoch training must include every window without dropping a partial batch')
+                accumulation = int(config.training.gradient_accumulation_steps)
+                config.training.max_steps = (epochs * batches + accumulation - 1) // accumulation
         set_seed(int(config.research.seed))
         # Route fixed windows through the dataset's existing generic params API.
         config.dataset.params = OmegaConf.merge(config.dataset.get('params', {}), {
@@ -140,6 +150,12 @@ class ACSplineFactory(TrainingFactory):
                                 Path(config.system.checkpoint_dir) /
                                 ('fresh_reload' if args.diagnostic_eval_only else 'generation'),
                                 reference_checkpoint=args.diagnostic_eval_only)
+        if trainer.rank == 0 and not args.diagnostic_eval_only:
+            name = f'checkpoint_step_{trainer.global_step}'
+            checkpoint = Path(config.system.checkpoint_dir) / name
+            if not (checkpoint / 'research_adapter.pt').is_file() or not (checkpoint / 'research_config.json').is_file():
+                raise FileNotFoundError(f'Final research checkpoint is missing: {checkpoint}')
+            (Path(config.system.checkpoint_dir) / 'final_checkpoint.txt').write_text(name + '\n')
         accelerator.wait_for_everyone()
 
 

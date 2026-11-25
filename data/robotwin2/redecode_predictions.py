@@ -54,8 +54,11 @@ def main():
             obs = window['observation_index']
             prefix = contract['executed_prefix']
             times = np.minimum(obs + prefix['source_stride'] * np.arange(1, prefix['command_count'] + 1), len(actions) - 1)
-            packet = extract_local(spline, obs, contract['knot_scaling'])
-            target, _ = decode_local(packet['parameters'], times, obs, contract['knot_scaling'], contract['normalization'])
+            if 'row_budget' in prefix:
+                target = actions[times]
+            else:
+                packet = extract_local(spline, obs, contract['knot_scaling'])
+                target, _ = decode_local(packet['parameters'], times, obs, contract['knot_scaling'], contract['normalization'])
             np.testing.assert_allclose(target, targets[i], rtol=0, atol=2e-5)
             samples = []
             for j, seed in enumerate(seeds):

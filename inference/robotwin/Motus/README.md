@@ -192,6 +192,6 @@ bash per_eval_logs.sh
 The deployed policy wrapper in this directory remains dense-only. The MOTUS
 spline research adapter resolves the installed `robotwin_spline` evaluator.
 Install it in any environment using that adapter as described in
-[RESEARCH_TRAINING.md](../../../RESEARCH_TRAINING.md#shared-spline-preprocessing); keep the checkpoint decoder
+[RESEARCH_TRAINING.md](../../../experiments/ac_spline_pilot/docs/RESEARCH_TRAINING.md#shared-spline-preprocessing); keep the checkpoint decoder
 entry `data.robotwin2.adaptive_spline.decode_local`. No learned spline simulator
 rollout has been run.

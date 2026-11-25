@@ -20,7 +20,7 @@ research:
   diagnostic:
     windows: 4
     seeds: [0, 1, 2, 3]
-  pilot_defaults: {updates: 1000, effective_batch: 16, learning_rate: 0.0001}
+  pilot_defaults: {epochs: 15, effective_batch: 16, learning_rate: 0.0001}
 dataset:
   dataset_dir: ${oc.env:MOTUS_DATASET_ROOT}
   task_mode: single

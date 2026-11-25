@@ -1,0 +1,7 @@
+# Corrected spline targets over the original clean-50 observations and schedule.
+base_config: robotwin_pilot_C.yaml
+research:
+  spline_execution_rows: 36
+  spline_diagnostics: true
+system:
+  checkpoint_dir: outputs/ac_splinewam_C/train

@@ -115,8 +115,10 @@ else
 fi
 echo "Dataset: $MOTUS_DATASET_ROOT (clean place_can_basket, seed-0 45/5 split)"
 echo "Outputs: $run_root"
+declare -A checkpoints
 for variant in A C; do
-    echo "Variant $variant: 1000 optimizer updates"
+    echo "Variant $variant: 15 epochs"
+    variant_dir="$run_root/$variant/robotwin_pilot_$variant/pilot-seed-0"
     command=(srun --ntasks=1 --gpus=1 --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}"
         bash scripts/cluster/environment.sh --gpu env "${container_env[@]}"
         python -u -m experiments.ac_spline_pilot.trainer
@@ -125,19 +127,25 @@ for variant in A C; do
     if "$dry_run"; then
         printf '%q ' "${command[@]}"
         printf '\n'
+        checkpoint="$variant_dir/<final_checkpoint>"
     else
         "${command[@]}" 2>&1 | tee "$run_root/logs/train_${variant}.log"
-        checkpoint="$run_root/$variant/robotwin_pilot_$variant/pilot-seed-0/checkpoint_step_1000"
+        if [[ ! -f "$variant_dir/final_checkpoint.txt" ]]; then
+            echo "Training did not publish its final checkpoint: $variant_dir/final_checkpoint.txt" >&2; exit 2;
+        fi
+        read -r checkpoint_name < "$variant_dir/final_checkpoint.txt"
+        [[ "$checkpoint_name" =~ ^checkpoint_step_[0-9]+$ ]] || { echo 'Invalid final checkpoint name' >&2; exit 2; }
+        checkpoint="$variant_dir/$checkpoint_name"
         [[ -f "$checkpoint/research_adapter.pt" && -f "$checkpoint/research_config.json" ]] || {
             echo "Training did not produce its final checkpoint: $checkpoint" >&2; exit 2;
         }
     fi
-
+    checkpoints[$variant]="$checkpoint"
 done
 # These are real closed-loop rollouts. generation/ above remains offline diagnostics.
 eval_status=0
 for variant in A C; do
-    checkpoint="$run_root/$variant/robotwin_pilot_$variant/pilot-seed-0/checkpoint_step_1000"
+    checkpoint="${checkpoints[$variant]}"
     command=(srun --ntasks=1 --gpus=1 --cpus-per-task="${SLURM_CPUS_PER_TASK:-8}"
         bash scripts/cluster/environment.sh --gpu env "OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}"
         python -u -m experiments.ac_spline_pilot.simulator --task "$task"

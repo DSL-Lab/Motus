@@ -57,6 +57,20 @@ class DataSplitTests(unittest.TestCase):
         self.assertFalse(self.training & self.validation)
         self.assertEqual(self.validate(), result)
 
+    def test_expanded_split_is_exact_and_deterministic(self):
+        files = [(Path(path).parent, Path(path).suffix)
+                 for path in next(iter(self.episodes.values())).values()]
+        for folder, suffix in files:
+            for index in range(50, 170):
+                (folder / f'episode{index}{suffix}').touch()
+        episodes, train, val = clean_episode_split(self.root, train_episodes=150, validation_episodes=20)
+        self.assertEqual((len(train), len(val)), (150, 20))
+        self.assertFalse(train & val)
+        self.assertEqual(train | val, set(episodes))
+        paths = sorted(episodes)
+        order = np.random.default_rng(0).permutation(170)
+        self.assertEqual(val, {paths[index] for index in order[:20]})
+
     def test_contract_accepts_all_50_episodes_while_preview_uses_four_windows(self):
         for name, data in [('normalization', self.normalization), ('scaling', self.scaling), ('windows', self.manifest)]:
             (self.root / f'{name}.json').write_text(json.dumps(data))

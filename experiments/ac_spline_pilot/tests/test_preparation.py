@@ -82,6 +82,23 @@ class PreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'row mismatch'):
             inspect_sources(self.root / 'raw')
 
+    def test_expanded_corpus_rejects_duplicate_trajectories(self):
+        with self.assertRaisesRegex(ValueError, 'Duplicate recorded trajectory'):
+            inspect_sources(self.root / 'raw', require_unique=True)
+
+    def test_native_recording_loads_component_channels_without_action_shift(self):
+        from robotwin_spline.sidecar import JOINT_FIELDS, load_actions
+        with h5py.File(self.path, 'a') as file:
+            del file['action/joint_states']
+            del file['state/joint_states']
+            for field in JOINT_FIELDS:
+                file.create_dataset(f'state/{field}', data=file[f'action/{field}'][()] - 1)
+        record = inspect_sources(self.root / 'raw')[0]
+        timeline = make_timeline(record, self.root / 'actions.pt')
+        self.assertEqual(timeline['alignment']['action_dataset'], [f'action/{field}' for field in JOINT_FIELDS])
+        self.assertEqual(timeline['alignment']['extra_action_shift'], 0)
+        np.testing.assert_array_equal(load_actions(self.path), self.actions)
+
     def test_full_50_episode_pipeline_with_synthetic_language_embeddings(self):
         import contextlib
         import io
